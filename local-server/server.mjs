@@ -3,7 +3,6 @@ import express from 'express';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { pathToFileURL } from 'url';
 import {
   atomicWriteFile,
   AUTH_FILE,
@@ -12,6 +11,7 @@ import {
   extFromMime,
   IMAGE_CACHE_DIR,
   IMAGE_MAP_FILE,
+  isMainModule,
   loadLocalConfig,
   mirrorRemoteImagesToDisk,
   PID_FILE,
@@ -148,7 +148,9 @@ function verifySessionToken(token, secret, revokedJtis) {
 function scoreLanInterface(name, address) {
   const lower = name.toLowerCase();
   let score = 0;
-  if (/wi-?fi|wlan|wireless|ethernet|eth\d|en\d/i.test(lower)) score += 20;
+  if (/wi-?fi|wlan|wireless|sans fil|ethernet|eth\d|en\d|reseau local|r[eé]seau local/i.test(lower)) {
+    score += 20;
+  }
   if (/virtual|vmware|vbox|wsl|hyper-v|vethernet|docker|loopback|tailscale|hamachi/i.test(lower)) {
     score -= 50;
   }
@@ -163,7 +165,7 @@ function getLanAddresses() {
   const candidates = [];
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name] || []) {
-      if (iface.family === 'IPv4' && !iface.internal) {
+      if (iface.family === 'IPv4' && !iface.internal && !iface.address.startsWith('169.254.')) {
         candidates.push({
           name,
           address: iface.address,
@@ -172,8 +174,10 @@ function getLanAddresses() {
       }
     }
   }
-  candidates.sort((a, b) => b.score - a.score);
-  return [...new Set(candidates.map((c) => c.address))];
+  const physicalCandidates = candidates.filter((c) => c.score > -20);
+  const selected = physicalCandidates.length > 0 ? physicalCandidates : candidates;
+  selected.sort((a, b) => b.score - a.score);
+  return [...new Set(selected.map((c) => c.address))];
 }
 
 export function createLocalServerApp(customOptions = {}) {
@@ -814,25 +818,33 @@ function startCliServer() {
 
     const lans = getLanAddresses();
     const primary = getPrimaryLanUrl();
-    console.log(`\nSMARTMENU QR — Serveur Local Wi-Fi actif sur le port ${PORT}`);
+    console.log('\n==============================================================');
+    console.log(`  SMARTMENU QR — Serveur Local Wi-Fi actif (port ${PORT})`);
+    console.log('==============================================================');
     if (config.restaurantId || config.restaurantSlug) {
-      console.log(`- Mode isolé restaurant : ${config.restaurantSlug || config.restaurantId}`);
+      console.log(`  Mode isole restaurant : ${config.restaurantSlug || config.restaurantId}`);
     } else {
-      console.log('- Mode multi-restaurants local (aucun restaurantId verrouillé dans config.json)');
+      console.log('  Mode multi-restaurants local actif');
     }
-    console.log(`- Sur ce PC : http://localhost:${PORT}`);
+    console.log('');
+    console.log(`  [PC]        Adresse locale : http://localhost:${PORT}`);
+    if (config.publicLanUrl) {
+      console.log(`  [TELEPHONE] Adresse Wi-Fi  : ${config.publicLanUrl}`);
+    }
     if (lans.length > 0) {
       for (const ip of lans) {
-        console.log(`- Sur le réseau Wi-Fi local : http://${ip}:${PORT}`);
+        console.log(`  [TELEPHONE] Adresse Wi-Fi  : http://${ip}:${PORT}`);
       }
-    } else {
-      console.log('- Aucune adresse Wi-Fi/LAN détectée.');
+    } else if (!config.publicLanUrl) {
+      console.log('  [TELEPHONE] Aucune adresse Wi-Fi detectee (verifiez la connexion Wi-Fi du PC).');
     }
     if (config.restaurantSlug || config.restaurantId) {
       const slug = config.restaurantSlug || config.restaurantId;
-      console.log(`- Lien QR client recommandé : ${primary}/?restaurant=${slug}`);
+      console.log(`  [QR MENU]   Lien direct    : ${primary}/?restaurant=${slug}`);
     }
-    console.log('Appuyez sur Ctrl+C ou exécutez stop-windows.bat pour arrêter.\n');
+    console.log('==============================================================');
+    console.log('  Laissez cette fenetre ouverte pendant l\'utilisation.');
+    console.log('  Appuyez sur Ctrl+C ou lancez stop-windows.bat pour arreter.\n');
 
     if (config.autoSyncMinutes > 0 && config.supabaseUrl && config.supabaseAnonKey) {
       const intervalMs = Math.max(1, config.autoSyncMinutes) * 60 * 1000;
@@ -841,6 +853,19 @@ function startCliServer() {
       }, intervalMs);
       syncTimer.unref?.();
     }
+  });
+
+  server.on('error', (err) => {
+    cleanupPidFile();
+    if (err && err.code === 'EADDRINUSE') {
+      console.error(`\n[ERREUR] Le port ${PORT} est deja utilise par un autre programme.`);
+      console.error('Executez local-server\\stop-windows.bat ou changez "port" dans local-server\\config.json.\n');
+    } else if (err && err.code === 'EACCES') {
+      console.error(`\n[ERREUR] Permission refusee pour ouvrir le port ${PORT}.\n`);
+    } else {
+      console.error('\n[ERREUR] Impossible de demarrer le serveur local :', err?.message || err);
+    }
+    process.exit(1);
   });
 
   function shutdown() {
@@ -853,6 +878,6 @@ function startCliServer() {
   process.on('SIGTERM', shutdown);
 }
 
-if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+if (isMainModule(import.meta.url)) {
   startCliServer();
 }

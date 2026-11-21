@@ -4,6 +4,19 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
+export function isMainModule(metaUrl) {
+  if (!process.argv[1]) return false;
+  try {
+    const entry = fs.realpathSync(path.resolve(process.argv[1]));
+    const self = fs.realpathSync(fileURLToPath(metaUrl));
+    return process.platform === 'win32'
+      ? entry.toLowerCase() === self.toLowerCase()
+      : entry === self;
+  } catch {
+    return pathToFileURL(path.resolve(process.argv[1])).href === metaUrl;
+  }
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const ROOT_DIR = path.resolve(__dirname, '..');
@@ -300,7 +313,7 @@ export async function pullCloudCatalogToLocal({ timeoutMs = 8000, quiet = false 
   }
 }
 
-if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+if (isMainModule(import.meta.url)) {
   const quiet = process.argv.includes('--quiet');
   const timeoutArg = process.argv.find((a) => a.startsWith('--timeout='));
   const timeoutMs = timeoutArg ? Number(timeoutArg.split('=')[1]) || 6000 : 8000;

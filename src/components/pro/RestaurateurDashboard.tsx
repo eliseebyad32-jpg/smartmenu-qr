@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Download, ExternalLink, ImagePlus, Palette, Printer, QrCode, Trash2 } from 'lucide-react';
+import { Check, Copy, Download, ExternalLink, ImagePlus, Palette, Printer, QrCode, Trash2 } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
@@ -24,6 +24,17 @@ interface RestaurateurDashboardProps {
 }
 
 const COLOR_SWATCHES = ['#DC2626', '#EA580C', '#E11D48', '#D97706', '#059669', '#2563EB'];
+const RESTAURATEUR_TAB_KEY = 'smartmenu_qr_restaurateur_tab_v1';
+
+function readStoredDashboardTab(): 'products' | 'branding' | 'qr' {
+  if (typeof window === 'undefined') return 'products';
+  try {
+    const raw = window.localStorage.getItem(RESTAURATEUR_TAB_KEY);
+    return raw === 'branding' || raw === 'qr' ? raw : 'products';
+  } catch {
+    return 'products';
+  }
+}
 
 export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
   restaurant,
@@ -40,13 +51,24 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
   const { t, formatFC } = useLanguage();
   const { showToast } = useToast();
 
-  const [tab, setTab] = useState<'products' | 'branding' | 'qr'>('products');
+  const [tab, setTab] = useState<'products' | 'branding' | 'qr'>(() =>
+    readStoredDashboardTab()
+  );
   const [name, setName] = useState(restaurant.name);
   const [logoUrl, setLogoUrl] = useState(restaurant.logoUrl || '');
   const [primaryColor, setPrimaryColor] = useState(restaurant.primaryColor || '#DC2626');
   const [secondaryColor, setSecondaryColor] = useState(restaurant.secondaryColor || '#F97316');
   const [qrPreview, setQrPreview] = useState('');
+  const [copiedLink, setCopiedLink] = useState(false);
   const [uploadingLogo, setUploadingLogo] = useState(false);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(RESTAURATEUR_TAB_KEY, tab);
+    } catch {
+      // Ignore storage errors
+    }
+  }, [tab]);
 
   useEffect(() => {
     setName(restaurant.name);
@@ -60,13 +82,21 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
   )}`;
 
   useEffect(() => {
+    let active = true;
     QRCode.toDataURL(directMenuUrl, {
       width: 320,
       margin: 2,
       color: { dark: '#09090B', light: '#FFFFFF' },
     })
-      .then(setQrPreview)
-      .catch(() => setQrPreview(''));
+      .then((url) => {
+        if (active) setQrPreview(url);
+      })
+      .catch(() => {
+        // Keep previously generated QR image intact on transient errors
+      });
+    return () => {
+      active = false;
+    };
   }, [directMenuUrl]);
 
   const scopedItems = menuItems.filter((m) => m.restaurantId === restaurant.id);
@@ -136,6 +166,17 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
     link.download = `smartmenu-qr-${restaurant.slug}.png`;
     link.click();
     showToast(t.qr.downloadPng);
+  };
+
+  const handleCopyPermanentLink = async () => {
+    try {
+      await navigator.clipboard.writeText(directMenuUrl);
+      setCopiedLink(true);
+      showToast(t.qr.copied);
+      window.setTimeout(() => setCopiedLink(false), 2000);
+    } catch {
+      // Clipboard fallback ignored
+    }
   };
 
   return (
@@ -386,6 +427,18 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
               {directMenuUrl}
             </div>
             <div className="flex flex-wrap gap-3 pt-2">
+              <button
+                type="button"
+                onClick={handleCopyPermanentLink}
+                className="inline-flex items-center gap-2 min-h-[44px] px-4 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-sm font-medium text-white cursor-pointer"
+              >
+                {copiedLink ? (
+                  <Check className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+                ) : (
+                  <Copy className="w-4 h-4 text-zinc-300" aria-hidden="true" />
+                )}
+                <span>{copiedLink ? t.qr.copied : t.qr.copyLink}</span>
+              </button>
               <button
                 type="button"
                 onClick={handleDownloadQr}

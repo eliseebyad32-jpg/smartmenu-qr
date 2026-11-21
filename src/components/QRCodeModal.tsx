@@ -11,14 +11,47 @@ interface QRCodeModalProps {
   onClose: () => void;
 }
 
+function getTableLabelKey(restaurantId: string): string {
+  return `smartmenu_qr_table_label_${restaurantId}`;
+}
+
 export const QRCodeModal: React.FC<QRCodeModalProps> = ({ restaurant, onClose }) => {
   const { t } = useLanguage();
   const { showToast } = useToast();
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copied, setCopied] = useState(false);
-  const [tableLabel, setTableLabel] = useState('');
+  const [tableLabel, setTableLabel] = useState(() => {
+    if (typeof window === 'undefined' || !restaurant) return '';
+    try {
+      return window.localStorage.getItem(getTableLabelKey(restaurant.id)) ?? '';
+    } catch {
+      return '';
+    }
+  });
   const [lanBaseUrl, setLanBaseUrl] = useState<string | null>(null);
   const [preferLanUrl, setPreferLanUrl] = useState(false);
+
+  useEffect(() => {
+    if (!restaurant) return;
+    try {
+      setTableLabel(window.localStorage.getItem(getTableLabelKey(restaurant.id)) ?? '');
+    } catch {
+      // Ignore storage errors
+    }
+  }, [restaurant?.id]);
+
+  useEffect(() => {
+    if (!restaurant) return;
+    try {
+      if (tableLabel) {
+        window.localStorage.setItem(getTableLabelKey(restaurant.id), tableLabel);
+      } else {
+        window.localStorage.removeItem(getTableLabelKey(restaurant.id));
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }, [restaurant?.id, tableLabel]);
 
   useEffect(() => {
     if (!restaurant) return;
@@ -34,7 +67,7 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({ restaurant, onClose })
     return () => {
       active = false;
     };
-  }, [restaurant]);
+  }, [restaurant?.id]);
 
   const baseOrigin = preferLanUrl && lanBaseUrl ? lanBaseUrl : window.location.origin;
 
@@ -46,6 +79,7 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({ restaurant, onClose })
 
   useEffect(() => {
     if (!restaurant || !menuUrl) return;
+    let active = true;
     QRCode.toDataURL(menuUrl, {
       width: 420,
       margin: 2,
@@ -54,9 +88,16 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({ restaurant, onClose })
         light: '#FFFFFF',
       },
     })
-      .then(setQrDataUrl)
-      .catch(() => setQrDataUrl(''));
-  }, [restaurant, menuUrl]);
+      .then((url) => {
+        if (active) setQrDataUrl(url);
+      })
+      .catch(() => {
+        // Keep current QR image visible if regeneration fails
+      });
+    return () => {
+      active = false;
+    };
+  }, [restaurant?.id, menuUrl]);
 
   if (!restaurant) return null;
 

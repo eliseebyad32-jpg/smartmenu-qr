@@ -22,6 +22,17 @@ import { ProAuthGate } from './pro/ProAuthGate';
 import { RestaurateurDashboard } from './pro/RestaurateurDashboard';
 
 const SESSION_KEY = 'smartmenu_qr_pro_user_id';
+const ADMIN_MODE_KEY = 'smartmenu_qr_admin_mode_v1';
+
+function readStoredAdminMode(): 'overview' | 'venue' | 'security' {
+  if (typeof window === 'undefined') return 'overview';
+  try {
+    const raw = window.localStorage.getItem(ADMIN_MODE_KEY);
+    return raw === 'venue' || raw === 'security' ? raw : 'overview';
+  } catch {
+    return 'overview';
+  }
+}
 
 interface ProWorkspaceProps {
   restaurants: Restaurant[];
@@ -98,7 +109,17 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
   });
   const [supabaseUser, setSupabaseUser] = useState<PlatformUser | null>(null);
   const [checkingSession, setCheckingSession] = useState<boolean>(supabaseReady);
-  const [adminMode, setAdminMode] = useState<'overview' | 'venue' | 'security'>('overview');
+  const [adminMode, setAdminMode] = useState<'overview' | 'venue' | 'security'>(() =>
+    readStoredAdminMode()
+  );
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ADMIN_MODE_KEY, adminMode);
+    } catch {
+      // Ignore storage errors
+    }
+  }, [adminMode]);
 
   useEffect(() => {
     if (!supabaseReady) {
@@ -121,14 +142,17 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
 
     const supabase = getSupabaseClient();
     const { data: authSub } = supabase
-      ? supabase.auth.onAuthStateChange((_event, session) => {
-          if (!session) {
+      ? supabase.auth.onAuthStateChange((event, session) => {
+          if (event === 'SIGNED_OUT' || !session) {
             setSupabaseUser(null);
             return;
           }
           fetchCurrentSupabaseUser().then((user) => {
             if (!mounted) return;
-            setSupabaseUser(user);
+            setSupabaseUser((prev) => {
+              if (user) return user;
+              return prev && prev.id === session.user.id ? prev : null;
+            });
           });
         })
       : { data: { subscription: null } };
@@ -162,7 +186,6 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
       if (user.role === 'restaurateur' && user.assignedRestaurantId) {
         onSelectRestaurant(user.assignedRestaurantId);
       }
-      setAdminMode('overview');
       if (onAuthSessionChanged) {
         await onAuthSessionChanged();
       }
@@ -173,7 +196,6 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
     if (user.role === 'restaurateur' && user.assignedRestaurantId) {
       onSelectRestaurant(user.assignedRestaurantId);
     }
-    setAdminMode('overview');
   };
 
   const handleLogout = async () => {

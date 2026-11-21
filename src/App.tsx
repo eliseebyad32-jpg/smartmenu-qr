@@ -73,6 +73,31 @@ const QRCodeModal = lazy(() =>
   import('./components/QRCodeModal').then((m) => ({ default: m.QRCodeModal }))
 );
 
+const ACTIVE_VIEW_KEY = 'smartmenu_qr_active_view_v1';
+const OPEN_QR_STATE_KEY = 'smartmenu_qr_open_qr_v1';
+
+function readStoredActiveView(): AppView {
+  if (typeof window === 'undefined') return 'customer';
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_VIEW_KEY);
+    return raw === 'pro' ? 'pro' : 'customer';
+  } catch {
+    return 'customer';
+  }
+}
+
+function readStoredOpenQr(): Restaurant | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(OPEN_QR_STATE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Restaurant | null;
+    return parsed && parsed.id && parsed.slug ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function getInitialRestaurantSlug(): string | null {
   if (typeof window === 'undefined') return null;
   const params = new URLSearchParams(window.location.search);
@@ -126,9 +151,9 @@ function SmartMenuShell() {
     }
     return initialCachedSnapshot?.restaurants[0]?.id ?? 'rocomamas-lubumbashi';
   });
-  const [activeView, setActiveView] = useState<AppView>('customer');
+  const [activeView, setActiveView] = useState<AppView>(() => readStoredActiveView());
   const [selectedDish, setSelectedDish] = useState<MenuItem | null>(null);
-  const [qrRestaurant, setQrRestaurant] = useState<Restaurant | null>(null);
+  const [openQrSnapshot, setOpenQrSnapshot] = useState<Restaurant | null>(() => readStoredOpenQr());
   const [cartOpen, setCartOpen] = useState(false);
 
   const [syncStatus, setSyncStatus] = useState<SyncStatus>(
@@ -464,6 +489,28 @@ function SmartMenuShell() {
   const activeRestaurant =
     restaurants.find((r) => r.id === activeRestaurantId) ?? restaurants[0] ?? null;
 
+  const qrRestaurant = openQrSnapshot
+    ? restaurants.find((r) => r.id === openQrSnapshot.id) ?? openQrSnapshot
+    : null;
+
+  const handleOpenQr = useCallback((restaurant: Restaurant) => {
+    setOpenQrSnapshot(restaurant);
+    try {
+      window.localStorage.setItem(OPEN_QR_STATE_KEY, JSON.stringify(restaurant));
+    } catch {
+      // Ignore storage errors
+    }
+  }, []);
+
+  const handleCloseQr = useCallback(() => {
+    setOpenQrSnapshot(null);
+    try {
+      window.localStorage.removeItem(OPEN_QR_STATE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+  }, []);
+
   const restaurantDishes = activeRestaurant
     ? menuItems.filter((item) => item.restaurantId === activeRestaurant.id)
     : [];
@@ -597,6 +644,11 @@ function SmartMenuShell() {
   const handleNavigateView = (view: AppView, sectionId?: string) => {
     activeViewRef.current = view;
     setActiveView(view);
+    try {
+      window.localStorage.setItem(ACTIVE_VIEW_KEY, view);
+    } catch {
+      // Ignore storage errors
+    }
     if (view === 'customer' && sectionId) {
       window.setTimeout(() => {
         if (sectionId === 'top') {
@@ -1064,7 +1116,7 @@ function SmartMenuShell() {
               onExploreMenu={() =>
                 document.getElementById('menu')?.scrollIntoView({ behavior: 'smooth' })
               }
-              onOpenQr={() => setQrRestaurant(activeRestaurant)}
+              onOpenQr={() => handleOpenQr(activeRestaurant)}
             />
 
             <SpecialtiesSection
@@ -1101,7 +1153,7 @@ function SmartMenuShell() {
                   baseUpdatedAt,
                 })
               }
-              onOpenQr={() => setQrRestaurant(activeRestaurant)}
+              onOpenQr={() => handleOpenQr(activeRestaurant)}
             />
           </main>
         ) : (
@@ -1140,7 +1192,7 @@ function SmartMenuShell() {
             onDeleteMenuItem={handleDeleteMenuItem}
             onToggleAvailability={handleToggleAvailability}
             onAddCategory={handleAddCategory}
-            onOpenQr={(r) => setQrRestaurant(r)}
+            onOpenQr={(r) => handleOpenQr(r)}
             onOpenCustomerMenu={(id) => {
               handleSelectRestaurant(id);
               handleNavigateView('customer', 'top');
@@ -1194,7 +1246,7 @@ function SmartMenuShell() {
         )}
 
         {qrRestaurant && (
-          <QRCodeModal restaurant={qrRestaurant} onClose={() => setQrRestaurant(null)} />
+          <QRCodeModal restaurant={qrRestaurant} onClose={handleCloseQr} />
         )}
       </Suspense>
 

@@ -87,6 +87,30 @@ const SEED_RESTAURANT_HERO_BY_ID = new Map(
   INITIAL_RESTAURANTS.map((rest) => [rest.id, rest.heroImage])
 );
 
+const SEED_USER_IDS = new Set(['user-super-admin', 'user-roco-owner', 'user-kin-owner']);
+
+function hasLegacySeedSecrets(rawUsers: Partial<PlatformUser>[] | undefined): boolean {
+  if (!Array.isArray(rawUsers)) return false;
+  return rawUsers.some(
+    (u) =>
+      u.id &&
+      SEED_USER_IDS.has(u.id) &&
+      (Boolean(u.password) || (typeof u.email === 'string' && u.email.includes('@')))
+  );
+}
+
+function scrubSeedUsers(rawUsers: PlatformUser[]): PlatformUser[] {
+  return rawUsers.map((u) => {
+    if (!SEED_USER_IDS.has(u.id)) return u;
+    const seedMatch = INITIAL_USERS.find((s) => s.id === u.id);
+    return {
+      ...u,
+      email: seedMatch ? seedMatch.email : 'demo-local',
+      password: '',
+    };
+  });
+}
+
 function normalizeState(
   raw: Partial<PlatformState> | undefined,
   allowSeedUsers = true
@@ -95,6 +119,13 @@ function normalizeState(
     return null;
   }
   const now = new Date().toISOString();
+  const normalizedUsers =
+    Array.isArray(raw.users) && raw.users.length > 0
+      ? scrubSeedUsers(raw.users)
+      : allowSeedUsers
+      ? INITIAL_USERS
+      : [];
+
   return {
     restaurants: raw.restaurants.map((r) => {
       const seedHero = SEED_RESTAURANT_HERO_BY_ID.get(r.id);
@@ -118,12 +149,7 @@ function normalizeState(
       }
       return item;
     }),
-    users:
-      Array.isArray(raw.users) && raw.users.length > 0
-        ? raw.users
-        : allowSeedUsers
-        ? INITIAL_USERS
-        : [],
+    users: normalizedUsers,
     updatedAt: raw.updatedAt || now,
     baseUpdatedAt: raw.baseUpdatedAt || raw.updatedAt || now,
   };
@@ -152,7 +178,12 @@ export function loadCachedSnapshotSync(allowSeedUsers = false): PlatformState | 
   try {
     const raw = window.localStorage.getItem(LS_FALLBACK_KEY);
     if (!raw) return null;
-    return normalizeState(JSON.parse(raw) as Partial<PlatformState>, allowSeedUsers);
+    const parsed = JSON.parse(raw) as Partial<PlatformState>;
+    const normalized = normalizeState(parsed, allowSeedUsers);
+    if (normalized && hasLegacySeedSecrets(parsed.users)) {
+      window.localStorage.setItem(LS_FALLBACK_KEY, JSON.stringify(normalized));
+    }
+    return normalized;
   } catch {
     return null;
   }
@@ -170,7 +201,12 @@ export async function loadPlatformState(allowSeedFallback = true): Promise<Platf
     });
     db.close();
     const normalized = normalizeState(record, allowSeedFallback);
-    if (normalized) return normalized;
+    if (normalized) {
+      if (hasLegacySeedSecrets(record?.users)) {
+        await savePlatformState(normalized);
+      }
+      return normalized;
+    }
   } catch {
     // Fallback to localStorage below
   }
@@ -178,8 +214,14 @@ export async function loadPlatformState(allowSeedFallback = true): Promise<Platf
   try {
     const raw = window.localStorage.getItem(LS_FALLBACK_KEY);
     if (raw) {
-      const normalized = normalizeState(JSON.parse(raw) as Partial<PlatformState>, allowSeedFallback);
-      if (normalized) return normalized;
+      const parsed = JSON.parse(raw) as Partial<PlatformState>;
+      const normalized = normalizeState(parsed, allowSeedFallback);
+      if (normalized) {
+        if (hasLegacySeedSecrets(parsed.users)) {
+          await savePlatformState(normalized);
+        }
+        return normalized;
+      }
     }
   } catch {
     // Use seed defaults

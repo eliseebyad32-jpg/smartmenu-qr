@@ -165,7 +165,12 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
 
   const currentUser = supabaseReady
     ? supabaseUser
-    : users.find((u) => u.id === currentUserId && u.isActive) ?? null;
+    : users.find(
+        (u) =>
+          u.id === currentUserId &&
+          u.isActive &&
+          (u.password.length > 0 || (u.id === 'user-roco-owner' && u.role === 'restaurateur'))
+      ) ?? null;
 
   useEffect(() => {
     if (supabaseReady) return;
@@ -376,8 +381,8 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
                 </li>
                 <li>
                   {language === 'fr'
-                    ? 'Script de démonstration non destructif (1 restaurant + 4 plats + Super Admin eliseebyad32@gmail.com) : supabase/seed.sql'
-                    : 'Non-destructive demo seed script (1 venue + 4 dishes + Super Admin eliseebyad32@gmail.com): supabase/seed.sql'}
+                    ? 'Script de démonstration non destructif (1 restaurant + 4 plats + profil Super Admin) : supabase/seed.sql'
+                    : 'Non-destructive demo seed script (1 venue + 4 dishes + Super Admin profile): supabase/seed.sql'}
                 </li>
                 <li>
                   {language === 'fr'

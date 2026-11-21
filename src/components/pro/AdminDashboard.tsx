@@ -71,13 +71,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [rAddrEn, setRAddrEn] = useState('');
   const [oName, setOName] = useState('');
   const [oEmail, setOEmail] = useState('');
-  const [oPass, setOPass] = useState('Demo2026!');
+  const [oPass, setOPass] = useState('');
 
   // Add Owner Account form state
   const [showAddOwner, setShowAddOwner] = useState(false);
   const [newOwnerName, setNewOwnerName] = useState('');
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
-  const [newOwnerPass, setNewOwnerPass] = useState('Demo2026!');
+  const [newOwnerPass, setNewOwnerPass] = useState('');
   const [newOwnerRestId, setNewOwnerRestId] = useState(restaurants[0]?.id ?? '');
   const accountsSectionRef = useRef<HTMLDivElement | null>(null);
 
@@ -149,12 +149,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     const ok = await onCreateOwnerAccount({
       name: newOwnerName.trim(),
       email: newOwnerEmail.trim(),
-      password: newOwnerPass || 'Demo2026!',
+      password: newOwnerPass,
       restaurantId: newOwnerRestId,
     });
     if (ok === false) return;
     setNewOwnerName('');
     setNewOwnerEmail('');
+    setNewOwnerPass('');
     setShowAddOwner(false);
     showToast(t.toast.accountCreated);
   };
@@ -336,8 +337,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   className="min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
                 />
                 <input
-                  type="text"
+                  type="password"
                   required
+                  minLength={6}
                   value={oPass}
                   onChange={(e) => setOPass(e.target.value)}
                   placeholder={t.pro.ownerPassword}
@@ -626,8 +628,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div>
                 <label className="block text-xs text-zinc-400 mb-1">{t.pro.ownerPassword}</label>
                 <input
-                  type="text"
+                  type="password"
                   required
+                  minLength={6}
                   value={newOwnerPass}
                   onChange={(e) => setNewOwnerPass(e.target.value)}
                   className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"

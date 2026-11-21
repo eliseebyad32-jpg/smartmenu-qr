@@ -111,6 +111,7 @@ export const UI_TRANSLATIONS = {
       subtitle:
         'Connectez-vous en tant qu’Administrateur Principal ou Restaurateur pour gérer votre établissement.',
       emailLabel: 'Adresse e-mail professionnelle',
+      emailPlaceholder: 'nom@etablissement.com',
       passwordLabel: 'Mot de passe',
       loginBtn: 'Se connecter',
       logoutBtn: 'Déconnexion',
@@ -121,12 +122,13 @@ export const UI_TRANSLATIONS = {
         'Compte authentifié dans Supabase Auth, mais la lecture de public.profiles a été refusée par PostgreSQL/RLS. Vérifiez les privilèges GRANT et les politiques RLS (supabase/schema.sql).',
       idMismatch:
         'Un profil existe pour cet e-mail dans public.profiles, mais son identifiant (profiles.id) ne correspond pas à auth.users.id.',
-      demoQuickTitle: 'Comptes de démonstration (mode local)',
+      demoQuickTitle: 'Espace démonstration',
       demoQuickNote:
-        'Cliquez sur un compte ci-dessous pour pré-remplir les identifiants de test :',
+        'Découvrez l’interface de gestion sur l’établissement de démonstration sans exposer d’identifiants.',
+      demoAccessBtn: 'Accéder à la démonstration',
       supabaseActive: 'Supabase Auth & PostgreSQL actifs',
       supabaseFallback:
-        'Mode démonstration local actif — Supabase non configuré (variables VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY requises pour la production).',
+        'Mode démonstration local actif — aucun identifiant ni mot de passe n’est exposé publiquement.',
     },
     pro: {
       eyebrow: 'Administration & gestion multi-restaurants',
@@ -388,6 +390,7 @@ export const UI_TRANSLATIONS = {
       subtitle:
         'Sign in as Super Admin or Restaurant Owner to manage your venue independently.',
       emailLabel: 'Work email address',
+      emailPlaceholder: 'name@restaurant.com',
       passwordLabel: 'Password',
       loginBtn: 'Sign in',
       logoutBtn: 'Sign out',
@@ -398,11 +401,13 @@ export const UI_TRANSLATIONS = {
         'Authenticated in Supabase Auth, but reading public.profiles was rejected by PostgreSQL/RLS. Verify GRANT privileges and RLS policies (supabase/schema.sql).',
       idMismatch:
         'A profile exists for this email in public.profiles, but its id (profiles.id) does not match auth.users.id.',
-      demoQuickTitle: 'Demo accounts (local mode)',
-      demoQuickNote: 'Click an account below to pre-fill test credentials:',
+      demoQuickTitle: 'Demo workspace',
+      demoQuickNote:
+        'Explore the demo venue management interface without exposing any credentials.',
+      demoAccessBtn: 'Access demonstration',
       supabaseActive: 'Supabase Auth & PostgreSQL active',
       supabaseFallback:
-        'Local demo mode active — Supabase not configured (VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY required for production).',
+        'Local demo mode active — no credentials or passwords are exposed publicly.',
     },
     pro: {
       eyebrow: 'Multi-restaurant administration & control',

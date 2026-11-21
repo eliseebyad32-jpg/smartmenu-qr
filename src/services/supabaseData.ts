@@ -531,6 +531,38 @@ export async function createOwnerAccountInSupabase(payload: {
   return mapProfileToPlatformUser(inserted as DbProfileRow);
 }
 
+export async function deleteRestaurantInSupabase(restaurantId: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase not configured');
+
+  const { error: rpcErr } = await supabase.rpc('delete_restaurant_cascade', {
+    target_restaurant_id: restaurantId,
+  });
+  if (!rpcErr) return;
+
+  // Fallback sequence if the SQL RPC function has not been deployed on the remote DB yet
+  const { error: itemsErr } = await supabase
+    .from('menu_items')
+    .delete()
+    .eq('restaurant_id', restaurantId);
+  if (itemsErr) throw itemsErr;
+
+  const { error: catsErr } = await supabase
+    .from('categories')
+    .delete()
+    .eq('restaurant_id', restaurantId);
+  if (catsErr) throw catsErr;
+
+  const { error: profErr } = await supabase
+    .from('profiles')
+    .update({ restaurant_id: null })
+    .eq('restaurant_id', restaurantId);
+  if (profErr) throw profErr;
+
+  const { error: restErr } = await supabase.from('restaurants').delete().eq('id', restaurantId);
+  if (restErr) throw restErr;
+}
+
 export async function toggleUserProfileActiveInSupabase(
   userId: string,
   isActive: boolean
@@ -540,6 +572,19 @@ export async function toggleUserProfileActiveInSupabase(
   const { error } = await supabase
     .from('profiles')
     .update({ is_active: isActive })
+    .eq('id', userId);
+  if (error) throw error;
+}
+
+export async function reassignOwnerRestaurantInSupabase(
+  userId: string,
+  restaurantId: string | null
+): Promise<void> {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase not configured');
+  const { error } = await supabase
+    .from('profiles')
+    .update({ restaurant_id: restaurantId })
     .eq('id', userId);
   if (error) throw error;
 }
@@ -565,6 +610,32 @@ export async function insertCategoryInSupabase(category: Category): Promise<Cate
     .single();
   if (error) throw error;
   return mapRowToCategory(data as DbCategoryRow);
+}
+
+export async function updateCategoryInSupabase(category: Category): Promise<Category> {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase not configured');
+  const { data, error } = await supabase
+    .from('categories')
+    .update({
+      name_fr: category.name.fr,
+      name_en: category.name.en,
+      description_fr: category.description.fr || '',
+      description_en: category.description.en || '',
+      sort_order: category.order,
+    })
+    .eq('id', category.id)
+    .select()
+    .single();
+  if (error) throw error;
+  return mapRowToCategory(data as DbCategoryRow);
+}
+
+export async function deleteCategoryInSupabase(categoryId: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase not configured');
+  const { error } = await supabase.from('categories').delete().eq('id', categoryId);
+  if (error) throw error;
 }
 
 export async function upsertMenuItemInSupabase(

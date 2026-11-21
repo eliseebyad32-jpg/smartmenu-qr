@@ -3,17 +3,25 @@ import {
   Ban,
   CheckCircle2,
   ExternalLink,
+  ImagePlus,
   Pencil,
   Plus,
   QrCode,
   ShieldAlert,
   Store,
+  Trash2,
   UserPlus,
   Users,
 } from 'lucide-react';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
+import { isSupabaseConfigured } from '../../services/supabaseClient';
+import { uploadAssetToSupabaseStorage } from '../../services/supabaseData';
+import { uploadAssetToLocalServer } from '../../services/syncService';
 import { MenuItem, PlatformUser, Restaurant } from '../../types/menu';
+import { readAndOptimizeImageBlob } from '../../utils/imageUpload';
+
+const COLOR_SWATCHES = ['#DC2626', '#EA580C', '#E11D48', '#D97706', '#059669', '#2563EB'];
 
 interface AdminDashboardProps {
   restaurants: Restaurant[];
@@ -31,6 +39,7 @@ interface AdminDashboardProps {
   }) => Promise<boolean> | boolean | void;
   onUpdateRestaurant: (restaurant: Restaurant) => void;
   onToggleRestaurantStatus: (restaurantId: string) => void;
+  onDeleteRestaurant: (restaurantId: string) => Promise<boolean> | boolean | void;
   onCreateOwnerAccount: (payload: {
     name: string;
     email: string;
@@ -38,6 +47,7 @@ interface AdminDashboardProps {
     restaurantId: string;
   }) => Promise<boolean> | boolean | void;
   onToggleUserActive: (userId: string) => void;
+  onReassignOwner: (userId: string, restaurantId: string | null) => Promise<boolean> | boolean | void;
   onManageRestaurant: (restaurantId: string) => void;
   onOpenQr: (restaurant: Restaurant) => void;
   onOpenCustomerMenu: (restaurantId: string) => void;
@@ -50,8 +60,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onAddRestaurant,
   onUpdateRestaurant,
   onToggleRestaurantStatus,
+  onDeleteRestaurant,
   onCreateOwnerAccount,
   onToggleUserActive,
+  onReassignOwner,
   onManageRestaurant,
   onOpenQr,
   onOpenCustomerMenu,
@@ -62,6 +74,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [tab, setTab] = useState<'restaurants' | 'accounts'>('restaurants');
   const [showAddRest, setShowAddRest] = useState(false);
   const [editingRest, setEditingRest] = useState<Restaurant | null>(null);
+  const [pendingDeleteRest, setPendingDeleteRest] = useState<Restaurant | null>(null);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
 
   // Add Restaurant form state
   const [rName, setRName] = useState('');
@@ -138,6 +152,55 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     onUpdateRestaurant(editingRest);
     setEditingRest(null);
     showToast(t.toast.restaurantUpdated);
+  };
+
+  const handleEditLogoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !editingRest) return;
+    setUploadingLogo(true);
+    try {
+      const optimized = await readAndOptimizeImageBlob(file, 400);
+      if (isSupabaseConfigured() && navigator.onLine) {
+        try {
+          const publicUrl = await uploadAssetToSupabaseStorage(
+            editingRest.id,
+            'logos',
+            `logo.${optimized.extension}`,
+            optimized.blob,
+            optimized.contentType
+          );
+          setEditingRest((prev) => (prev ? { ...prev, logoUrl: publicUrl } : prev));
+          showToast(t.toast.uploadSuccess);
+          return;
+        } catch {
+          // Fall through to local PC server or inline dataUrl
+        }
+      }
+      const localUrl = await uploadAssetToLocalServer(
+        editingRest.id,
+        'logos',
+        `logo.${optimized.extension}`,
+        optimized.dataUrl
+      );
+      setEditingRest((prev) => (prev ? { ...prev, logoUrl: localUrl ?? optimized.dataUrl } : prev));
+      showToast(t.toast.uploadLocalFallback);
+    } catch {
+      showToast(t.toast.validationError, 'error');
+    } finally {
+      setUploadingLogo(false);
+    }
+  };
+
+  const handleConfirmDeleteRestaurant = async () => {
+    if (!pendingDeleteRest) return;
+    const ok = await onDeleteRestaurant(pendingDeleteRest.id);
+    if (ok !== false) {
+      if (editingRest?.id === pendingDeleteRest.id) {
+        setEditingRest(null);
+      }
+      showToast(t.toast.restaurantDeleted);
+    }
+    setPendingDeleteRest(null);
   };
 
   const handleCreateOwner = async (e: React.FormEvent) => {
@@ -458,7 +521,163 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
                   />
                 </div>
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    {t.pro.restaurantPhone}
+                  </label>
+                  <input
+                    type="text"
+                    value={editingRest.phone}
+                    onChange={(e) => setEditingRest({ ...editingRest, phone: e.target.value })}
+                    className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    {t.pro.restaurantHoursFr}
+                  </label>
+                  <input
+                    type="text"
+                    value={editingRest.hours.fr}
+                    onChange={(e) =>
+                      setEditingRest({
+                        ...editingRest,
+                        hours: { ...editingRest.hours, fr: e.target.value },
+                      })
+                    }
+                    className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    {t.pro.restaurantHoursEn}
+                  </label>
+                  <input
+                    type="text"
+                    value={editingRest.hours.en}
+                    onChange={(e) =>
+                      setEditingRest({
+                        ...editingRest,
+                        hours: { ...editingRest.hours, en: e.target.value },
+                      })
+                    }
+                    className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
+                  />
+                </div>
               </div>
+
+              {/* Super Admin Branding Controls (Logo & Colors) */}
+              <div className="pt-4 border-t border-zinc-800 space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-zinc-400 mb-2">
+                    {t.pro.logoLabel}
+                  </label>
+                  <div className="flex flex-wrap items-center gap-4">
+                    {editingRest.logoUrl ? (
+                      <img
+                        src={editingRest.logoUrl}
+                        alt={editingRest.name}
+                        className="w-14 h-14 rounded-xl object-cover border border-zinc-700"
+                      />
+                    ) : (
+                      <div
+                        style={{ backgroundColor: editingRest.primaryColor || '#DC2626' }}
+                        className="w-14 h-14 rounded-xl flex items-center justify-center font-display text-xl font-bold text-white"
+                      >
+                        {editingRest.name.charAt(0)}
+                      </div>
+                    )}
+
+                    <label className="inline-flex items-center gap-2 min-h-[40px] px-4 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-xs font-medium text-white cursor-pointer">
+                      <ImagePlus className="w-4 h-4 text-orange-400" aria-hidden="true" />
+                      <span>{uploadingLogo ? t.pro.uploadingAsset : t.pro.uploadLogo}</span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        disabled={uploadingLogo}
+                        onChange={handleEditLogoFile}
+                        className="sr-only"
+                      />
+                    </label>
+
+                    {editingRest.logoUrl && (
+                      <button
+                        type="button"
+                        onClick={() => setEditingRest({ ...editingRest, logoUrl: '' })}
+                        className="inline-flex items-center gap-1.5 min-h-[40px] px-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-red-300 hover:text-red-200 cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>{t.pro.removeLogo}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-400 mb-2">
+                      {t.pro.primaryColorLabel}
+                    </label>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {COLOR_SWATCHES.map((hex) => (
+                        <button
+                          key={hex}
+                          type="button"
+                          onClick={() => setEditingRest({ ...editingRest, primaryColor: hex })}
+                          style={{ backgroundColor: hex }}
+                          aria-label={hex}
+                          className={`w-7 h-7 rounded-lg border-2 cursor-pointer ${
+                            editingRest.primaryColor.toUpperCase() === hex
+                              ? 'border-white scale-110'
+                              : 'border-transparent'
+                          }`}
+                        />
+                      ))}
+                      <input
+                        type="color"
+                        value={editingRest.primaryColor || '#DC2626'}
+                        onChange={(e) =>
+                          setEditingRest({ ...editingRest, primaryColor: e.target.value })
+                        }
+                        className="w-8 h-8 rounded bg-transparent cursor-pointer"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-400 mb-2">
+                      {t.pro.secondaryColorLabel}
+                    </label>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {['#F97316', '#F59E0B', '#EC4899', '#10B981', '#38BDF8', '#FAFAFA'].map(
+                        (hex) => (
+                          <button
+                            key={hex}
+                            type="button"
+                            onClick={() => setEditingRest({ ...editingRest, secondaryColor: hex })}
+                            style={{ backgroundColor: hex }}
+                            aria-label={hex}
+                            className={`w-7 h-7 rounded-lg border-2 cursor-pointer ${
+                              editingRest.secondaryColor.toUpperCase() === hex
+                                ? 'border-white scale-110'
+                                : 'border-transparent'
+                            }`}
+                          />
+                        )
+                      )}
+                      <input
+                        type="color"
+                        value={editingRest.secondaryColor || '#F97316'}
+                        onChange={(e) =>
+                          setEditingRest({ ...editingRest, secondaryColor: e.target.value })
+                        }
+                        className="w-8 h-8 rounded bg-transparent cursor-pointer"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="flex justify-end gap-2">
                 <button
                   type="button"
@@ -590,6 +809,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     >
                       <ExternalLink className="w-4 h-4" />
                     </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setPendingDeleteRest(rest)}
+                      aria-label={`${t.pro.deleteRestaurant} ${rest.name}`}
+                      className="min-h-[38px] px-3 rounded-lg bg-zinc-900 hover:bg-red-950/60 border border-zinc-800 hover:border-red-700/60 text-xs text-zinc-400 hover:text-red-400 inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>{t.pro.deleteRestaurant}</span>
+                    </button>
                   </div>
                 </div>
               );
@@ -700,25 +929,86 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       </p>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => {
-                        onToggleUserActive(acc.id);
-                        showToast(t.toast.accountToggled);
-                      }}
-                      className={`min-h-[38px] px-3.5 rounded-lg border text-xs font-medium cursor-pointer ${
-                        acc.isActive
-                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                          : 'bg-red-500/10 border-red-500/30 text-red-300'
-                      }`}
-                    >
-                      {acc.isActive ? t.pro.statusActive : t.pro.statusSuspended}
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <select
+                        aria-label={t.pro.reassignVenue}
+                        value={acc.assignedRestaurantId ?? ''}
+                        onChange={async (e) => {
+                          const nextId = e.target.value || null;
+                          const ok = await onReassignOwner(acc.id, nextId);
+                          if (ok !== false) {
+                            showToast(t.toast.ownerReassigned);
+                          }
+                        }}
+                        className="min-h-[38px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-xs text-zinc-200"
+                      >
+                        <option value="">{t.pro.unassignedVenue}</option>
+                        {restaurants.map((r) => (
+                          <option key={r.id} value={r.id}>
+                            {r.name}
+                          </option>
+                        ))}
+                      </select>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onToggleUserActive(acc.id);
+                          showToast(t.toast.accountToggled);
+                        }}
+                        className={`min-h-[38px] px-3.5 rounded-lg border text-xs font-medium cursor-pointer ${
+                          acc.isActive
+                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                            : 'bg-red-500/10 border-red-500/30 text-red-300'
+                        }`}
+                      >
+                        {acc.isActive ? t.pro.statusActive : t.pro.statusSuspended}
+                      </button>
+                    </div>
                   </div>
                 );
               })}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Confirm Delete Restaurant Modal (Super Admin only) */}
+      {pendingDeleteRest && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-delete-rest-title"
+        >
+          <div className="w-full max-w-md rounded-2xl bg-[#141418] border border-zinc-800 p-6 shadow-2xl space-y-4">
+            <h3
+              id="confirm-delete-rest-title"
+              className="font-display text-2xl font-bold text-white"
+            >
+              {t.pro.confirmDeleteRestTitle}
+            </h3>
+            <p className="text-sm text-zinc-300 leading-relaxed">
+              {t.pro.confirmDeleteRestBody}{' '}
+              <span className="font-semibold text-white">({pendingDeleteRest.name})</span>
+            </p>
+            <div className="flex justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setPendingDeleteRest(null)}
+                className="min-h-[42px] px-4 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-sm font-medium text-zinc-200 cursor-pointer"
+              >
+                {t.pro.cancel}
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeleteRestaurant}
+                className="min-h-[42px] px-4 rounded-lg bg-red-600 hover:bg-red-500 text-sm font-semibold text-white cursor-pointer"
+              >
+                {t.pro.confirmDeleteRestBtn}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

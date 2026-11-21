@@ -2,10 +2,13 @@ import React, { useEffect, useState } from 'react';
 import {
   ArrowLeft,
   Database,
+  KeyRound,
+  Lock,
   LogOut,
   RefreshCw,
   RotateCcw,
   ShieldCheck,
+  Unlock,
 } from 'lucide-react';
 import { useLanguage } from '../context/LanguageContext';
 import { useToast } from '../context/ToastContext';
@@ -15,6 +18,13 @@ import {
   isSupabaseConfigured,
 } from '../services/supabaseClient';
 import { fetchCurrentSupabaseUser, signOutSupabase } from '../services/supabaseData';
+import {
+  fetchLocalAuthStatus,
+  LocalAuthStatus,
+  loginLocalServerWithPin,
+  logoutLocalServer,
+  setupLocalServerPin,
+} from '../services/syncService';
 import { Category, MenuItem, PlatformUser, Restaurant } from '../types/menu';
 import { PWAInstallButton } from './PWAInstallButton';
 import { AdminDashboard } from './pro/AdminDashboard';
@@ -53,6 +63,7 @@ interface ProWorkspaceProps {
   }) => Promise<boolean> | boolean | void;
   onUpdateRestaurant: (restaurant: Restaurant) => void;
   onToggleRestaurantStatus: (restaurantId: string) => void;
+  onDeleteRestaurant: (restaurantId: string) => Promise<boolean> | boolean | void;
   onCreateOwnerAccount: (payload: {
     name: string;
     email: string;
@@ -60,15 +71,22 @@ interface ProWorkspaceProps {
     restaurantId: string;
   }) => Promise<boolean> | boolean | void;
   onToggleUserActive: (userId: string) => void;
+  onReassignOwner: (userId: string, restaurantId: string | null) => Promise<boolean> | boolean | void;
   onSaveMenuItem: (item: MenuItem, isNew: boolean) => void;
   onDeleteMenuItem: (itemId: string) => void;
   onToggleAvailability: (itemId: string) => void;
   onAddCategory: (category: Category) => void;
+  onUpdateCategory: (category: Category) => void;
+  onDeleteCategory: (categoryId: string) => void;
   onOpenQr: (restaurant: Restaurant) => void;
   onOpenCustomerMenu: (restaurantId: string) => void;
   onResetDemo: () => void;
   onRefreshCloud?: () => Promise<void>;
   onAuthSessionChanged?: () => Promise<void>;
+  localServerActive?: boolean;
+  localAuthRequired?: boolean;
+  onAuthUserChange?: (user: PlatformUser | null) => void;
+  onLocalAuthSuccess?: () => Promise<void>;
 }
 
 export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
@@ -81,17 +99,25 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
   onAddRestaurant,
   onUpdateRestaurant,
   onToggleRestaurantStatus,
+  onDeleteRestaurant,
   onCreateOwnerAccount,
   onToggleUserActive,
+  onReassignOwner,
   onSaveMenuItem,
   onDeleteMenuItem,
   onToggleAvailability,
   onAddCategory,
+  onUpdateCategory,
+  onDeleteCategory,
   onOpenQr,
   onOpenCustomerMenu,
   onResetDemo,
   onRefreshCloud,
   onAuthSessionChanged,
+  localServerActive = false,
+  localAuthRequired = false,
+  onAuthUserChange,
+  onLocalAuthSuccess,
 }) => {
   const { t, language } = useLanguage();
   const { showToast } = useToast();
@@ -112,6 +138,10 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
   const [adminMode, setAdminMode] = useState<'overview' | 'venue' | 'security'>(() =>
     readStoredAdminMode()
   );
+  const [localAuthStatus, setLocalAuthStatus] = useState<LocalAuthStatus | null>(null);
+  const [localPinInput, setLocalPinInput] = useState('');
+  const [localPinError, setLocalPinError] = useState('');
+  const [localPinBusy, setLocalPinBusy] = useState(false);
 
   useEffect(() => {
     try {
@@ -163,14 +193,34 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
     };
   }, [supabaseReady]);
 
+  // Strict security: in browser-local mode (!supabaseReady), never resolve super_admin from IndexedDB/localStorage
   const currentUser = supabaseReady
     ? supabaseUser
     : users.find(
         (u) =>
           u.id === currentUserId &&
           u.isActive &&
-          (u.password.length > 0 || (u.id === 'user-roco-owner' && u.role === 'restaurateur'))
+          u.role === 'restaurateur' &&
+          (u.password.length > 0 || u.id === 'user-roco-owner')
       ) ?? null;
+
+  useEffect(() => {
+    onAuthUserChange?.(currentUser);
+  }, [currentUser, onAuthUserChange]);
+
+  useEffect(() => {
+    if (!localServerActive || !currentUser) {
+      setLocalAuthStatus(null);
+      return;
+    }
+    let mounted = true;
+    fetchLocalAuthStatus().then((status) => {
+      if (mounted) setLocalAuthStatus(status);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [localServerActive, currentUser?.id, localAuthRequired]);
 
   useEffect(() => {
     if (supabaseReady) return;
@@ -197,13 +247,18 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
       return;
     }
 
+    if (user.role !== 'restaurateur') return;
     setCurrentUserId(user.id);
-    if (user.role === 'restaurateur' && user.assignedRestaurantId) {
+    if (user.assignedRestaurantId) {
       onSelectRestaurant(user.assignedRestaurantId);
     }
   };
 
   const handleLogout = async () => {
+    await logoutLocalServer();
+    setLocalAuthStatus((prev) =>
+      prev ? { ...prev, authenticated: false, role: null, expiresAt: null } : null
+    );
     if (supabaseReady) {
       await signOutSupabase();
       setSupabaseUser(null);
@@ -337,6 +392,114 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
           </div>
         </div>
 
+        {/* Local Wi-Fi PC Server PIN Session Bar */}
+        {localServerActive && (
+          <div className="rounded-2xl bg-[#141418] border border-zinc-800 p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="flex items-start gap-3">
+              {localAuthStatus?.authenticated ? (
+                <Unlock className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" aria-hidden="true" />
+              ) : (
+                <KeyRound className="w-5 h-5 text-orange-400 shrink-0 mt-0.5" aria-hidden="true" />
+              )}
+              <div className="space-y-0.5">
+                <p className="text-xs font-semibold text-white">{t.pro.localPinTitle}</p>
+                <p className="text-xs text-zinc-400">
+                  {localAuthStatus?.authenticated
+                    ? t.pro.localPinUnlocked
+                    : !localAuthStatus?.pinConfigured && localAuthStatus?.localhostSetupAllowed
+                    ? t.pro.localPinSetupNote
+                    : t.pro.localPinLocked}
+                </p>
+                {localPinError && (
+                  <p role="alert" className="text-xs font-medium text-red-400 pt-0.5">
+                    {localPinError}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {localAuthStatus?.authenticated ? (
+              <button
+                type="button"
+                disabled={localPinBusy}
+                onClick={async () => {
+                  setLocalPinBusy(true);
+                  await logoutLocalServer();
+                  const status = await fetchLocalAuthStatus();
+                  setLocalAuthStatus(status);
+                  setLocalPinBusy(false);
+                }}
+                className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-xs font-medium text-zinc-200 self-start lg:self-auto cursor-pointer"
+              >
+                <Lock className="w-3.5 h-3.5 text-orange-400" aria-hidden="true" />
+                <span>{t.pro.localPinLockBtn}</span>
+              </button>
+            ) : (
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setLocalPinError('');
+                  const trimmedPin = localPinInput.trim();
+                  if (trimmedPin.length < 4) {
+                    setLocalPinError(t.toast.validationError);
+                    return;
+                  }
+                  setLocalPinBusy(true);
+                  try {
+                    const targetRestId = scopedRestaurant?.id;
+                    if (!localAuthStatus?.pinConfigured && localAuthStatus?.localhostSetupAllowed) {
+                      const setupRes = await setupLocalServerPin(
+                        trimmedPin,
+                        undefined,
+                        targetRestId
+                      );
+                      if (!setupRes.ok) {
+                        setLocalPinError(setupRes.error || t.auth.invalidCreds);
+                        return;
+                      }
+                    }
+                    const loginRes = await loginLocalServerWithPin(trimmedPin, targetRestId);
+                    if (!loginRes.ok) {
+                      setLocalPinError(loginRes.error || t.auth.invalidCreds);
+                      return;
+                    }
+                    setLocalPinInput('');
+                    const status = await fetchLocalAuthStatus();
+                    setLocalAuthStatus(status);
+                    showToast(t.toast.loginSuccess);
+                    if (onLocalAuthSuccess) {
+                      await onLocalAuthSuccess();
+                    }
+                  } finally {
+                    setLocalPinBusy(false);
+                  }
+                }}
+                className="flex flex-wrap items-center gap-2"
+              >
+                <input
+                  type="password"
+                  value={localPinInput}
+                  onChange={(e) => setLocalPinInput(e.target.value)}
+                  placeholder={t.pro.localPinPlaceholder}
+                  aria-label={t.pro.localPinPlaceholder}
+                  minLength={4}
+                  maxLength={32}
+                  className="min-h-[40px] w-48 px-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-white placeholder:text-zinc-500 focus:outline-none focus:border-orange-500"
+                />
+                <button
+                  type="submit"
+                  disabled={localPinBusy}
+                  className="min-h-[40px] px-4 rounded-lg bg-red-600 hover:bg-red-500 disabled:opacity-60 text-xs font-semibold text-white cursor-pointer"
+                >
+                  {!localAuthStatus?.pinConfigured && localAuthStatus?.localhostSetupAllowed
+                    ? t.pro.localPinSetupBtn
+                    : t.pro.localPinUnlockBtn}
+                </button>
+              </form>
+            )}
+          </div>
+        )}
+
         {/* Role-Based Views */}
         {currentUser.role === 'super_admin' && adminMode === 'overview' && (
           <AdminDashboard
@@ -346,8 +509,10 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
             onAddRestaurant={onAddRestaurant}
             onUpdateRestaurant={onUpdateRestaurant}
             onToggleRestaurantStatus={onToggleRestaurantStatus}
+            onDeleteRestaurant={onDeleteRestaurant}
             onCreateOwnerAccount={onCreateOwnerAccount}
             onToggleUserActive={onToggleUserActive}
+            onReassignOwner={onReassignOwner}
             onManageRestaurant={(id) => {
               onSelectRestaurant(id);
               setAdminMode('venue');
@@ -423,11 +588,12 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
                 restaurant={scopedRestaurant}
                 categories={categories}
                 menuItems={menuItems}
-                onUpdateRestaurant={onUpdateRestaurant}
                 onSaveItem={onSaveMenuItem}
                 onDeleteItem={onDeleteMenuItem}
                 onToggleAvailability={onToggleAvailability}
                 onAddCategory={onAddCategory}
+                onUpdateCategory={onUpdateCategory}
+                onDeleteCategory={onDeleteCategory}
                 onOpenQr={onOpenQr}
                 onOpenCustomerMenu={onOpenCustomerMenu}
               />

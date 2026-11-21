@@ -209,15 +209,37 @@ create policy "Super admins can insert restaurants"
   with check (public.is_super_admin());
 
 drop policy if exists "Super admins or assigned restaurateur can update restaurant" on public.restaurants;
-create policy "Super admins or assigned restaurateur can update restaurant"
+drop policy if exists "Only super admins can update restaurants" on public.restaurants;
+create policy "Only super admins can update restaurants"
   on public.restaurants for update
-  using (public.is_super_admin() or public.owns_restaurant(id))
-  with check (public.is_super_admin() or public.owns_restaurant(id));
+  using (public.is_super_admin())
+  with check (public.is_super_admin());
 
 drop policy if exists "Super admins can delete restaurants" on public.restaurants;
 create policy "Super admins can delete restaurants"
   on public.restaurants for delete
   using (public.is_super_admin());
+
+-- ATOMIC SUPER ADMIN CASCADE DELETE FOR RESTAURANTS (avoids category on delete restrict deadlock)
+create or replace function public.delete_restaurant_cascade(target_restaurant_id text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_super_admin() then
+    raise exception 'Permission denied: only super_admin can delete a restaurant';
+  end if;
+
+  delete from public.menu_items where restaurant_id = target_restaurant_id;
+  delete from public.categories where restaurant_id = target_restaurant_id;
+  update public.profiles set restaurant_id = null where restaurant_id = target_restaurant_id;
+  delete from public.restaurants where id = target_restaurant_id;
+end;
+$$;
+
+grant execute on function public.delete_restaurant_cascade(text) to authenticated;
 
 -- RLS POLICIES: PROFILES
 drop policy if exists "Users can view own profile or super admin views all" on public.profiles;
@@ -230,6 +252,29 @@ create policy "Only super admins manage profiles"
   on public.profiles for all
   using (public.is_super_admin())
   with check (public.is_super_admin());
+
+create or replace function public.prevent_non_admin_profile_escalation()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is not null and not public.is_super_admin() then
+    if new.role is distinct from old.role
+       or new.restaurant_id is distinct from old.restaurant_id
+       or new.is_active is distinct from old.is_active then
+      raise exception 'Permission denied: only super_admin can change role, restaurant_id, or is_active';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_profiles_prevent_escalation on public.profiles;
+create trigger trg_profiles_prevent_escalation
+  before update on public.profiles
+  for each row execute function public.prevent_non_admin_profile_escalation();
 
 -- RLS POLICIES: CATEGORIES
 drop policy if exists "Public can read categories" on public.categories;
@@ -292,7 +337,10 @@ create policy "Authenticated owners upload within their restaurant folder"
     bucket_id = 'restaurant-assets'
     and (
       public.is_super_admin()
-      or public.owns_restaurant((storage.foldername(name))[1])
+      or (
+        public.owns_restaurant((storage.foldername(name))[1])
+        and (storage.foldername(name))[2] = 'dishes'
+      )
     )
   );
 
@@ -304,14 +352,20 @@ create policy "Authenticated owners update within their restaurant folder"
     bucket_id = 'restaurant-assets'
     and (
       public.is_super_admin()
-      or public.owns_restaurant((storage.foldername(name))[1])
+      or (
+        public.owns_restaurant((storage.foldername(name))[1])
+        and (storage.foldername(name))[2] = 'dishes'
+      )
     )
   )
   with check (
     bucket_id = 'restaurant-assets'
     and (
       public.is_super_admin()
-      or public.owns_restaurant((storage.foldername(name))[1])
+      or (
+        public.owns_restaurant((storage.foldername(name))[1])
+        and (storage.foldername(name))[2] = 'dishes'
+      )
     )
   );
 
@@ -323,6 +377,9 @@ create policy "Authenticated owners delete within their restaurant folder"
     bucket_id = 'restaurant-assets'
     and (
       public.is_super_admin()
-      or public.owns_restaurant((storage.foldername(name))[1])
+      or (
+        public.owns_restaurant((storage.foldername(name))[1])
+        and (storage.foldername(name))[2] = 'dishes'
+      )
     )
   );

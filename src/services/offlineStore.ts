@@ -204,6 +204,22 @@ export async function loadPlatformState(allowSeedFallback = true): Promise<Platf
     if (normalized) {
       if (hasLegacySeedSecrets(record?.users)) {
         await savePlatformState(normalized);
+      } else {
+        // Also ensure legacy localStorage fallback doesn't retain old seed secrets
+        try {
+          const lsRaw = window.localStorage.getItem(LS_FALLBACK_KEY);
+          if (lsRaw) {
+            const lsParsed = JSON.parse(lsRaw) as Partial<PlatformState>;
+            if (hasLegacySeedSecrets(lsParsed.users)) {
+              const lsNormalized = normalizeState(lsParsed, allowSeedFallback);
+              if (lsNormalized) {
+                window.localStorage.setItem(LS_FALLBACK_KEY, JSON.stringify(lsNormalized));
+              }
+            }
+          }
+        } catch {
+          // Ignore localStorage fallback read/parse error
+        }
       }
       return normalized;
     }

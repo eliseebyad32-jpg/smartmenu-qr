@@ -12,6 +12,7 @@ export const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 export const IMAGE_CACHE_DIR = path.join(DATA_DIR, 'image-cache');
 export const IMAGE_MAP_FILE = path.join(DATA_DIR, 'image-map.json');
 export const DATA_FILE = path.join(DATA_DIR, 'catalog.json');
+export const AUTH_FILE = path.join(DATA_DIR, 'local-auth.json');
 export const PID_FILE = path.join(DATA_DIR, 'server.pid');
 export const CONFIG_FILE = path.join(__dirname, 'config.json');
 
@@ -57,6 +58,18 @@ export function loadLocalConfig() {
       process.env.VITE_SUPABASE_ANON_KEY ?? fileConfig.supabaseAnonKey ?? ''
     ).trim(),
     autoSyncMinutes: Number(process.env.AUTO_SYNC_MINUTES ?? fileConfig.autoSyncMinutes ?? 5),
+    sessionTtlMinutes: Math.max(
+      15,
+      Number(process.env.LOCAL_SESSION_TTL_MINUTES ?? fileConfig.sessionTtlMinutes ?? 480)
+    ),
+    maxLoginAttempts: Math.max(
+      3,
+      Number(process.env.LOCAL_MAX_LOGIN_ATTEMPTS ?? fileConfig.maxLoginAttempts ?? 5)
+    ),
+    lockoutMinutes: Math.max(
+      1,
+      Number(process.env.LOCAL_LOCKOUT_MINUTES ?? fileConfig.lockoutMinutes ?? 15)
+    ),
   };
 }
 

@@ -27,6 +27,8 @@ interface ProductManagerProps {
   onDeleteItem: (itemId: string) => void;
   onToggleAvailability: (itemId: string) => void;
   onAddCategory: (category: Category) => void;
+  onUpdateCategory: (category: Category) => void;
+  onDeleteCategory: (categoryId: string) => void;
 }
 
 export const ProductManager: React.FC<ProductManagerProps> = ({
@@ -37,6 +39,8 @@ export const ProductManager: React.FC<ProductManagerProps> = ({
   onDeleteItem,
   onToggleAvailability,
   onAddCategory,
+  onUpdateCategory,
+  onDeleteCategory,
 }) => {
   const { t, pick, formatFC } = useLanguage();
   const { showToast } = useToast();
@@ -50,6 +54,7 @@ export const ProductManager: React.FC<ProductManagerProps> = ({
   const [showCatForm, setShowCatForm] = useState(false);
   const [catNameFr, setCatNameFr] = useState('');
   const [catNameEn, setCatNameEn] = useState('');
+  const [editingCatId, setEditingCatId] = useState<string | null>(null);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
 
   const scopedCategories = useMemo(
@@ -154,6 +159,27 @@ export const ProductManager: React.FC<ProductManagerProps> = ({
       showToast(t.toast.validationError, 'error');
       return;
     }
+
+    if (editingCatId) {
+      const target = categories.find(
+        (c) => c.id === editingCatId && c.restaurantId === restaurant.id
+      );
+      if (!target) {
+        showToast(t.toast.permissionDenied, 'error');
+        return;
+      }
+      onUpdateCategory({
+        ...target,
+        name: { fr: catNameFr.trim(), en: catNameEn.trim() },
+      });
+      setCatNameFr('');
+      setCatNameEn('');
+      setEditingCatId(null);
+      setShowCatForm(false);
+      showToast(t.toast.categoryUpdated);
+      return;
+    }
+
     const slug = `${catNameFr}-${Date.now().toString(36)}`
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-');
@@ -168,6 +194,37 @@ export const ProductManager: React.FC<ProductManagerProps> = ({
     setCatNameEn('');
     setShowCatForm(false);
     showToast(t.toast.categoryAdded);
+  };
+
+  const handleStartEditCategory = (cat: Category) => {
+    if (cat.restaurantId !== restaurant.id) return;
+    setEditingCatId(cat.id);
+    setCatNameFr(cat.name.fr);
+    setCatNameEn(cat.name.en);
+    setShowCatForm(true);
+  };
+
+  const handleDeleteCustomCategory = (cat: Category) => {
+    if (cat.restaurantId !== restaurant.id) {
+      showToast(t.toast.permissionDenied, 'error');
+      return;
+    }
+    const usedByDishes = items.some(
+      (m) => m.restaurantId === restaurant.id && m.categoryId === cat.id
+    );
+    if (usedByDishes) {
+      showToast(t.pro.categoryHasDishes, 'error');
+      return;
+    }
+    onDeleteCategory(cat.id);
+    if (catFilter === cat.id) setCatFilter('all');
+    if (editingCatId === cat.id) {
+      setEditingCatId(null);
+      setCatNameFr('');
+      setCatNameEn('');
+      setShowCatForm(false);
+    }
+    showToast(t.toast.categoryDeleted);
   };
 
   const confirmDelete = () => {
@@ -214,7 +271,12 @@ export const ProductManager: React.FC<ProductManagerProps> = ({
         <div className="flex flex-wrap items-center gap-2.5">
           <button
             type="button"
-            onClick={() => setShowCatForm((p) => !p)}
+            onClick={() => {
+              setEditingCatId(null);
+              setCatNameFr('');
+              setCatNameEn('');
+              setShowCatForm((p) => !p);
+            }}
             className="inline-flex items-center gap-2 min-h-[42px] px-4 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-xs sm:text-sm font-medium text-zinc-200 cursor-pointer"
           >
             <FolderPlus className="w-4 h-4 text-orange-400" aria-hidden="true" />
@@ -232,7 +294,39 @@ export const ProductManager: React.FC<ProductManagerProps> = ({
         </div>
       </div>
 
-      {/* Add Category Form */}
+      {/* Restaurant Categories Strip (custom categories can be edited/deleted; global categories are locked) */}
+      {scopedCategories.some((c) => c.restaurantId === restaurant.id) && (
+        <div className="flex flex-wrap items-center gap-2">
+          {scopedCategories
+            .filter((c) => c.restaurantId === restaurant.id)
+            .map((cat) => (
+              <div
+                key={cat.id}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#141418] border border-zinc-800 text-xs text-zinc-200"
+              >
+                <span className="font-medium">{pick(cat.name)}</span>
+                <button
+                  type="button"
+                  onClick={() => handleStartEditCategory(cat)}
+                  aria-label={`${t.pro.editCategory} ${pick(cat.name)}`}
+                  className="p-1 text-zinc-400 hover:text-white cursor-pointer"
+                >
+                  <Pencil className="w-3 h-3" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleDeleteCustomCategory(cat)}
+                  aria-label={`${t.pro.deleteCategory} ${pick(cat.name)}`}
+                  className="p-1 text-zinc-400 hover:text-red-400 cursor-pointer"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+        </div>
+      )}
+
+      {/* Add / Edit Category Form */}
       {showCatForm && (
         <form
           onSubmit={handleCreateCategory}
@@ -263,11 +357,16 @@ export const ProductManager: React.FC<ProductManagerProps> = ({
               type="submit"
               className="flex-1 min-h-[40px] px-4 rounded-lg bg-red-600 hover:bg-red-500 text-xs sm:text-sm font-semibold text-white cursor-pointer"
             >
-              {t.pro.createCategoryBtn}
+              {editingCatId ? t.pro.saveCategoryBtn : t.pro.createCategoryBtn}
             </button>
             <button
               type="button"
-              onClick={() => setShowCatForm(false)}
+              onClick={() => {
+                setShowCatForm(false);
+                setEditingCatId(null);
+                setCatNameFr('');
+                setCatNameEn('');
+              }}
               className="min-h-[40px] px-3 rounded-lg bg-zinc-800 text-zinc-300 text-xs cursor-pointer"
             >
               {t.pro.cancel}

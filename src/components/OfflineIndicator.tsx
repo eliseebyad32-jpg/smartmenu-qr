@@ -7,6 +7,7 @@ interface OfflineIndicatorProps {
   syncStatus: SyncStatus;
   pendingCount: number;
   localServerActive?: boolean;
+  allowLocalOverwrite?: boolean;
   lastSyncedAt?: string | null;
   onSyncNow: () => void;
   onResolveConflict?: (strategy: 'keep_local' | 'use_server') => void;
@@ -16,6 +17,7 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
   syncStatus,
   pendingCount,
   localServerActive = false,
+  allowLocalOverwrite = false,
   lastSyncedAt,
   onSyncNow,
   onResolveConflict,
@@ -36,13 +38,15 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
           </div>
         </div>
         <div className="flex items-center gap-2 pt-1">
-          <button
-            type="button"
-            onClick={() => onResolveConflict('keep_local')}
-            className="min-h-[36px] px-3 rounded-lg bg-red-600 hover:bg-red-500 text-xs font-semibold text-white cursor-pointer"
-          >
-            {t.sync.keepLocal}
-          </button>
+          {allowLocalOverwrite && (
+            <button
+              type="button"
+              onClick={() => onResolveConflict('keep_local')}
+              className="min-h-[36px] px-3 rounded-lg bg-red-600 hover:bg-red-500 text-xs font-semibold text-white cursor-pointer"
+            >
+              {t.sync.keepLocal}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => onResolveConflict('use_server')}

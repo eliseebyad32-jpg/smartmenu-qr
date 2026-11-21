@@ -53,9 +53,10 @@ export const ProAuthGate: React.FC<ProAuthGateProps> = ({ users, onAuthenticated
         return;
       }
 
-      // Local authentication for locally created owner accounts (requires non-empty password)
+      // Local authentication for locally created owner accounts (requires non-empty password; super_admin requires Supabase Auth)
       const matched = users.find(
         (u) =>
+          u.role === 'restaurateur' &&
           u.password.length > 0 &&
           u.email.toLowerCase() === email.trim().toLowerCase() &&
           u.password === password &&

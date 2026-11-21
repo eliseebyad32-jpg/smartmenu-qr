@@ -4,6 +4,9 @@
   "restaurantSlug": "rocomamas-lubumbashi",
   "publicLanUrl": "",
   "autoSyncMinutes": 5,
+  "sessionTtlMinutes": 480,
+  "maxLoginAttempts": 5,
+  "lockoutMinutes": 15,
   "supabaseUrl": "",
   "supabaseAnonKey": ""
 }

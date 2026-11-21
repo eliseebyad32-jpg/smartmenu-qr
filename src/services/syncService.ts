@@ -9,6 +9,50 @@ import {
   setLastSyncedAt,
 } from './offlineStore';
 
+const LOCAL_AUTH_TOKEN_KEY = 'smartmenu_qr_local_token_v1';
+let memoryLocalAuthToken: string | null = null;
+
+export function getLocalAuthToken(): string | null {
+  if (memoryLocalAuthToken) return memoryLocalAuthToken;
+  if (typeof window === 'undefined') return null;
+  try {
+    const stored = window.sessionStorage.getItem(LOCAL_AUTH_TOKEN_KEY);
+    if (stored) {
+      memoryLocalAuthToken = stored;
+      return stored;
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+  return null;
+}
+
+function setLocalAuthToken(token: string | null): void {
+  memoryLocalAuthToken = token;
+  if (typeof window === 'undefined') return;
+  try {
+    if (token) {
+      window.sessionStorage.setItem(LOCAL_AUTH_TOKEN_KEY, token);
+    } else {
+      window.sessionStorage.removeItem(LOCAL_AUTH_TOKEN_KEY);
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
+export function clearLocalAuthToken(): void {
+  setLocalAuthToken(null);
+}
+
+function buildLocalAuthHeaders(extra?: Record<string, string>): Record<string, string> {
+  const token = getLocalAuthToken();
+  return {
+    ...(extra || {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
 export type SyncStatus = 'online' | 'offline' | 'syncing' | 'conflict' | 'error';
 
 export interface LocalServerInfo {
@@ -19,7 +63,26 @@ export interface LocalServerInfo {
   configuredPublicUrl?: string | null;
   restaurantId?: string | null;
   restaurantSlug?: string | null;
+  pinConfigured?: boolean;
   lastCloudSyncAt?: string | null;
+}
+
+export interface LocalAuthStatus {
+  pinConfigured: boolean;
+  authenticated: boolean;
+  role: 'super_admin' | 'restaurateur' | null;
+  restaurantId: string | null;
+  expiresAt: string | null;
+  localhostSetupAllowed: boolean;
+}
+
+export interface LocalAuthResult {
+  ok: boolean;
+  error?: string;
+  retryAfterSeconds?: number;
+  remainingAttempts?: number;
+  role?: 'restaurateur' | 'super_admin';
+  restaurantId?: string | null;
 }
 
 export interface SyncResult {
@@ -30,6 +93,7 @@ export interface SyncResult {
   lastSyncedAt?: string;
   errorMessage?: string;
   localServerActive?: boolean;
+  localAuthRequired?: boolean;
 }
 
 export async function fetchLocalServerInfo(): Promise<LocalServerInfo> {
@@ -53,10 +117,126 @@ export async function fetchLocalServerInfo(): Promise<LocalServerInfo> {
       configuredPublicUrl: body.configuredPublicUrl,
       restaurantId: body.restaurantId,
       restaurantSlug: body.restaurantSlug,
+      pinConfigured: body.pinConfigured,
       lastCloudSyncAt: body.lastCloudSyncAt,
     };
   } catch {
     return { active: false };
+  }
+}
+
+export async function fetchLocalAuthStatus(): Promise<LocalAuthStatus | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    const res = await fetch('/api/auth/local-status', {
+      method: 'GET',
+      headers: buildLocalAuthHeaders(),
+      cache: 'no-store',
+    });
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !contentType.includes('application/json')) return null;
+    const data = (await res.json()) as LocalAuthStatus & { ok?: boolean };
+    if (!data.ok) return null;
+    if (!data.authenticated && getLocalAuthToken()) {
+      clearLocalAuthToken();
+    }
+    return {
+      pinConfigured: Boolean(data.pinConfigured),
+      authenticated: Boolean(data.authenticated),
+      role: data.role ?? null,
+      restaurantId: data.restaurantId ?? null,
+      expiresAt: data.expiresAt ?? null,
+      localhostSetupAllowed: Boolean(data.localhostSetupAllowed),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function setupLocalServerPin(
+  pin: string,
+  currentPin?: string,
+  restaurantId?: string
+): Promise<LocalAuthResult> {
+  try {
+    const res = await fetch('/api/auth/setup-pin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin, currentPin, restaurantId }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      error?: string;
+      retryAfterSeconds?: number;
+      remainingAttempts?: number;
+      restaurantId?: string | null;
+    };
+    if (!res.ok || !body.ok) {
+      return {
+        ok: false,
+        error: body.error || `HTTP ${res.status}`,
+        retryAfterSeconds: body.retryAfterSeconds,
+        remainingAttempts: body.remainingAttempts,
+      };
+    }
+    return {
+      ok: true,
+      restaurantId: body.restaurantId ?? null,
+    };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function loginLocalServerWithPin(
+  pin: string,
+  restaurantId?: string
+): Promise<LocalAuthResult> {
+  try {
+    const res = await fetch('/api/auth/local-login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin, restaurantId }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      token?: string;
+      role?: 'restaurateur' | 'super_admin';
+      restaurantId?: string | null;
+      error?: string;
+      retryAfterSeconds?: number;
+      remainingAttempts?: number;
+    };
+    if (!res.ok || !body.ok || !body.token) {
+      return {
+        ok: false,
+        error: body.error || `HTTP ${res.status}`,
+        retryAfterSeconds: body.retryAfterSeconds,
+        remainingAttempts: body.remainingAttempts,
+      };
+    }
+    setLocalAuthToken(body.token);
+    return {
+      ok: true,
+      role: body.role ?? 'restaurateur',
+      restaurantId: body.restaurantId ?? null,
+    };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function logoutLocalServer(): Promise<void> {
+  const token = getLocalAuthToken();
+  clearLocalAuthToken();
+  if (!token) return;
+  try {
+    await fetch('/api/auth/local-logout', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch {
+    // Token already cleared locally
   }
 }
 
@@ -69,9 +249,13 @@ export async function uploadAssetToLocalServer(
   try {
     const res = await fetch('/api/assets/upload', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ restaurantId, folder, fileName, dataUrl }),
     });
+    if (res.status === 401) {
+      clearLocalAuthToken();
+      return null;
+    }
     if (!res.ok) return null;
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) return null;
@@ -185,24 +369,36 @@ export async function syncPendingOutboxWithSupabase(
 
     for (const mut of outbox) {
       try {
-        if (mut.entityType === 'category' && mut.operation === 'upsert' && mut.payload) {
-          await sb.insertCategoryInSupabase(mut.payload as Category);
-        } else if (mut.entityType === 'restaurant' && mut.operation === 'upsert' && mut.payload) {
-          const draft = mut.payload as Restaurant;
-          const syncedLogo = draft.logoUrl
-            ? await resolveImageForCloudSync(
-                draft.logoUrl,
-                draft.id,
-                'logos',
-                'logo',
-                sb.uploadAssetToSupabaseStorage
-              )
-            : '';
-          const saved = await sb.upsertRestaurantInSupabase(
-            { ...draft, logoUrl: syncedLogo },
-            Boolean(mut.isNew)
-          );
-          updatedRestaurants = updatedRestaurants.map((r) => (r.id === saved.id ? saved : r));
+        if (mut.entityType === 'category') {
+          if (mut.operation === 'delete' && mut.entityId) {
+            await sb.deleteCategoryInSupabase(mut.entityId);
+          } else if (mut.operation === 'upsert' && mut.payload) {
+            if (mut.isNew) {
+              await sb.insertCategoryInSupabase(mut.payload as Category);
+            } else {
+              await sb.updateCategoryInSupabase(mut.payload as Category);
+            }
+          }
+        } else if (mut.entityType === 'restaurant') {
+          if (mut.operation === 'delete' && mut.entityId) {
+            await sb.deleteRestaurantInSupabase(mut.entityId);
+          } else if (mut.operation === 'upsert' && mut.payload) {
+            const draft = mut.payload as Restaurant;
+            const syncedLogo = draft.logoUrl
+              ? await resolveImageForCloudSync(
+                  draft.logoUrl,
+                  draft.id,
+                  'logos',
+                  'logo',
+                  sb.uploadAssetToSupabaseStorage
+                )
+              : '';
+            const saved = await sb.upsertRestaurantInSupabase(
+              { ...draft, logoUrl: syncedLogo },
+              Boolean(mut.isNew)
+            );
+            updatedRestaurants = updatedRestaurants.map((r) => (r.id === saved.id ? saved : r));
+          }
         } else if (mut.entityType === 'menu_item') {
           if (mut.operation === 'delete' && mut.entityId) {
             await sb.deleteMenuItemInSupabase(mut.entityId);
@@ -272,20 +468,18 @@ export async function syncPendingOutboxWithSupabase(
 }
 
 /**
- * Attempts to synchronize local IndexedDB state with a local Windows LAN server (/api/catalog)
- * when present, preserving pending mutations safely in IndexedDB if offline or on error,
- * and surfacing 409 conflicts explicitly so data is never silently lost.
+ * Synchronizes local IndexedDB state with the local Windows LAN server (/api/catalog)
+ * when present. Public customer sessions must pass pullOnly: true so they never push writes;
+ * authenticated Pro writes attach a valid Bearer token and preserve outbox on 401/403/error.
  */
 export async function syncWithServer(
   localState: PlatformState,
   forceOverwrite = false,
-  options?: { lastCloudSyncAt?: string | null; pushOnlyToLocal?: boolean }
+  options?: { lastCloudSyncAt?: string | null; pushOnlyToLocal?: boolean; pullOnly?: boolean }
 ): Promise<SyncResult> {
   const outbox = await loadOutbox();
 
   if (typeof navigator !== 'undefined' && !navigator.onLine && typeof window !== 'undefined') {
-    // Still probe local LAN server even when browser thinks there's no WAN Internet:
-    // on a restaurant Wi-Fi without Internet, /api/health on the local PC IP can still respond!
     const probeLocal = await fetchLocalServerInfo();
     if (!probeLocal.active) {
       return {
@@ -312,17 +506,34 @@ export async function syncWithServer(
       };
     }
 
-    // Push local catalog to Windows LAN PC server when needed
-    if (outbox.length > 0 || options?.pushOnlyToLocal || forceOverwrite) {
+    const canPushWrites =
+      !options?.pullOnly && (outbox.length > 0 || options?.pushOnlyToLocal || forceOverwrite);
+
+    // Push local catalog to Windows LAN PC server only for authenticated Pro flows
+    if (canPushWrites) {
       const pushRes = await fetch('/api/catalog', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           state: localState,
           baseUpdatedAt: forceOverwrite ? undefined : localState.baseUpdatedAt,
           lastCloudSyncAt: options?.lastCloudSyncAt,
         }),
       });
+
+      if (pushRes.status === 401 || pushRes.status === 403) {
+        if (pushRes.status === 401) {
+          clearLocalAuthToken();
+        }
+        const errBody = (await pushRes.json().catch(() => ({}))) as { error?: string };
+        return {
+          status: 'error',
+          pendingCount: outbox.length,
+          localServerActive: true,
+          localAuthRequired: pushRes.status === 401,
+          errorMessage: errBody.error || 'Authentification locale Pro requise.',
+        };
+      }
 
       if (pushRes.status === 409) {
         const conflictBody = (await pushRes.json()) as { serverState?: PlatformState };
@@ -365,7 +576,7 @@ export async function syncWithServer(
       };
     }
 
-    // Pull latest state from local PC LAN server if newer than browser cache
+    // Pull latest state from local PC LAN server if newer than browser cache (safe read-only)
     const pullRes = await fetch('/api/catalog', { cache: 'no-store' });
     if (pullRes.ok) {
       const body = (await pullRes.json()) as { state?: PlatformState };
@@ -383,7 +594,7 @@ export async function syncWithServer(
         return {
           status: 'online',
           mergedState: updatedLocal,
-          pendingCount: 0,
+          pendingCount: outbox.length,
           lastSyncedAt: now,
           localServerActive: true,
         };

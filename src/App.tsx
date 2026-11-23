@@ -31,7 +31,6 @@ import {
   loadOutbox,
   loadPlatformState,
   PlatformState,
-  resetPlatformState,
   savePlatformState,
   setLastSyncedAt,
   SyncEntityType,
@@ -50,11 +49,19 @@ import {
   PermissionError,
 } from './services/permissions';
 import {
+  changeOwnLocalPassword,
+  createLocalServerOwner,
   fetchLocalServerInfo,
   getLocalAuthToken,
+  listLocalServerUsers,
+  reassignLocalServerOwner,
+  resetLocalServerUserPassword,
   syncPendingOutboxWithSupabase,
   SyncStatus,
   syncWithServer,
+  toggleLocalServerUserActive,
+  updateLocalServerUser,
+  updateOwnLocalCredentials,
 } from './services/syncService';
 import { AppView, Category, MenuItem, PlatformUser, Restaurant } from './types/menu';
 
@@ -92,6 +99,9 @@ const OPEN_QR_STATE_KEY = 'smartmenu_qr_open_qr_v1';
 function readStoredActiveView(): AppView {
   if (typeof window === 'undefined') return 'customer';
   try {
+    if (window.location.hash.includes('type=recovery')) {
+      return 'pro';
+    }
     const raw = window.localStorage.getItem(ACTIVE_VIEW_KEY);
     return raw === 'pro' ? 'pro' : 'customer';
   } catch {
@@ -165,6 +175,9 @@ function SmartMenuShell() {
     return initialCachedSnapshot?.restaurants[0]?.id ?? 'rocomamas-lubumbashi';
   });
   const [activeView, setActiveView] = useState<AppView>(() => readStoredActiveView());
+  const [passwordRecoveryPending, setPasswordRecoveryPending] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.location.hash.includes('type=recovery') : false
+  );
   const [selectedDish, setSelectedDish] = useState<MenuItem | null>(null);
   const [openQrSnapshot, setOpenQrSnapshot] = useState<Restaurant | null>(() => readStoredOpenQr());
   const [cartOpen, setCartOpen] = useState(false);
@@ -499,6 +512,22 @@ function SmartMenuShell() {
 
     init();
 
+    let recoverySub: { unsubscribe: () => void } | null = null;
+    if (isSupabaseEnvConfigured()) {
+      import('./services/supabaseClient').then(({ getSupabaseClient }) => {
+        if (!mounted) return;
+        const sb = getSupabaseClient();
+        if (!sb) return;
+        const { data } = sb.auth.onAuthStateChange((event) => {
+          if (event === 'PASSWORD_RECOVERY') {
+            setPasswordRecoveryPending(true);
+            setActiveView('pro');
+          }
+        });
+        recoverySub = data.subscription;
+      });
+    }
+
     const handleOnline = () => {
       if (isSupabaseEnvConfigured()) {
         refreshFromSupabase(true);
@@ -515,10 +544,26 @@ function SmartMenuShell() {
 
     return () => {
       mounted = false;
+      recoverySub?.unsubscribe();
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
   }, [initialCachedSnapshot, refreshFromSupabase, runSync]);
+
+  useEffect(() => {
+    if (supabaseEnabled || !localServerActive || currentProUser?.role !== 'super_admin') {
+      return;
+    }
+    let mounted = true;
+    listLocalServerUsers().then((list) => {
+      if (mounted) {
+        setUsers(list);
+      }
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [supabaseEnabled, localServerActive, currentProUser?.id, currentProUser?.role]);
 
   const activeRestaurant =
     restaurants.find((r) => r.id === activeRestaurantId) ?? restaurants[0] ?? null;
@@ -744,7 +789,8 @@ function SmartMenuShell() {
     addressFr: string;
     addressEn: string;
     ownerName: string;
-    ownerEmail: string;
+    ownerEmail?: string;
+    ownerUsername: string;
     ownerPassword: string;
   }): Promise<boolean> => {
     try {
@@ -762,7 +808,6 @@ function SmartMenuShell() {
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/(^-|-$)/g, '');
     const restId = `${slug}-${Date.now().toString(36)}`;
-    const ownerId = `user-${Date.now().toString(36)}`;
 
     const newRest: Restaurant = {
       id: restId,
@@ -793,7 +838,7 @@ function SmartMenuShell() {
       primaryColor: '#DC2626',
       secondaryColor: '#F97316',
       isActive: true,
-      ownerId,
+      ownerId: '',
       isDemo: false,
     };
 
@@ -801,44 +846,56 @@ function SmartMenuShell() {
       try {
         const sb = await loadSupabaseData();
         const createdRest = await sb.upsertRestaurantInSupabase(newRest, true);
-        let createdOwner: PlatformUser | null = null;
+        let ownerFailed = false;
         try {
-          createdOwner = await sb.createOwnerAccountInSupabase({
+          const createdOwner = await sb.createOwnerAccountInSupabase({
             name: payload.ownerName,
             email: payload.ownerEmail,
+            username: payload.ownerUsername,
             password: payload.ownerPassword,
             restaurantId: createdRest.id,
           });
           await sb.upsertRestaurantInSupabase({ ...createdRest, ownerId: createdOwner.id }, false);
-        } catch {
-          showToast(t.toast.supabaseError, 'error');
+        } catch (err) {
+          ownerFailed = true;
+          showToast(err instanceof Error ? err.message : t.toast.supabaseError, 'error');
         }
         sb.invalidateSupabaseCatalogCache();
         await refreshFromSupabase(true);
         setActiveRestaurantId(createdRest.id);
-        return true;
-      } catch {
-        showToast(t.toast.supabaseError, 'error');
+        return !ownerFailed;
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : t.toast.supabaseError, 'error');
         return false;
       }
     }
 
-    const newOwner: PlatformUser = {
-      id: ownerId,
-      name: payload.ownerName,
-      email: payload.ownerEmail,
-      password: payload.ownerPassword,
-      role: 'restaurateur',
-      assignedRestaurantId: restId,
-      isActive: true,
-    };
+    if (localServerActiveRef.current) {
+      const ownerRes = await createLocalServerOwner({
+        username: payload.ownerUsername,
+        email: payload.ownerEmail,
+        name: payload.ownerName,
+        password: payload.ownerPassword,
+        restaurantId: restId,
+      });
+      if (!ownerRes.ok || !ownerRes.user) {
+        showToast(ownerRes.error || t.toast.supabaseError, 'error');
+        return false;
+      }
+      const nextRest: Restaurant = { ...newRest, ownerId: ownerRes.user.id };
+      await persistLocal(
+        'add_restaurant',
+        [...restaurants, nextRest],
+        categories,
+        menuItems,
+        [...users, ownerRes.user]
+      );
+      handleSelectRestaurant(restId);
+      return true;
+    }
 
-    await persistLocal('add_restaurant', [...restaurants, newRest], categories, menuItems, [
-      ...users,
-      newOwner,
-    ]);
-    handleSelectRestaurant(restId);
-    return true;
+    showToast(t.auth.noBackendBody, 'error');
+    return false;
   };
 
   const handleUpdateRestaurant = async (updated: Restaurant) => {
@@ -978,7 +1035,8 @@ function SmartMenuShell() {
 
   const handleCreateOwnerAccount = async (payload: {
     name: string;
-    email: string;
+    email?: string;
+    username: string;
     password: string;
     restaurantId: string;
   }): Promise<boolean> => {
@@ -1006,23 +1064,69 @@ function SmartMenuShell() {
           true
         );
         return true;
-      } catch {
-        showToast(t.toast.supabaseError, 'error');
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : t.toast.supabaseError, 'error');
         return false;
       }
     }
 
-    const newOwner: PlatformUser = {
-      id: `user-${Date.now().toString(36)}`,
-      name: payload.name,
-      email: payload.email,
-      password: payload.password,
-      role: 'restaurateur',
-      assignedRestaurantId: payload.restaurantId,
-      isActive: true,
-    };
-    await persistLocal('create_owner', restaurants, categories, menuItems, [...users, newOwner]);
-    return true;
+    if (localServerActiveRef.current) {
+      const res = await createLocalServerOwner(payload);
+      if (!res.ok || !res.user) {
+        showToast(res.error || t.toast.supabaseError, 'error');
+        return false;
+      }
+      setUsers((prev) => [...prev, res.user!]);
+      return true;
+    }
+
+    showToast(t.auth.noBackendBody, 'error');
+    return false;
+  };
+
+  const handleUpdateOwnerProfile = async (payload: {
+    userId: string;
+    username: string;
+    name: string;
+    email?: string;
+    restaurantId: string | null;
+  }): Promise<PlatformUser | null> => {
+    try {
+      assertAuthorized(canManageAccounts(currentProUserRef.current));
+    } catch (err) {
+      if (err instanceof PermissionError) {
+        showToast(t.toast.permissionDenied, 'error');
+        return null;
+      }
+      throw err;
+    }
+
+    if (isSupabaseEnvConfigured()) {
+      try {
+        const sb = await loadSupabaseData();
+        const updated = await sb.updateOwnerProfileInSupabase(payload);
+        sb.invalidateSupabaseCatalogCache();
+        const nextUsers = users.map((u) => (u.id === updated.id ? updated : u));
+        await persistLocal('update_owner_profile', restaurants, categories, menuItems, nextUsers, true);
+        return updated;
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : t.toast.supabaseError, 'error');
+        return null;
+      }
+    }
+
+    if (localServerActiveRef.current) {
+      const res = await updateLocalServerUser(payload);
+      if (!res.ok || !res.user) {
+        showToast(res.error || t.toast.supabaseError, 'error');
+        return null;
+      }
+      setUsers((prev) => prev.map((u) => (u.id === res.user!.id ? res.user! : u)));
+      return res.user;
+    }
+
+    showToast(t.auth.noBackendBody, 'error');
+    return null;
   };
 
   const handleToggleUserActive = async (userId: string) => {
@@ -1055,8 +1159,14 @@ function SmartMenuShell() {
       return;
     }
 
-    const next = users.map((u) => (u.id === userId ? { ...u, isActive: nextActive } : u));
-    await persistLocal('toggle_user', restaurants, categories, menuItems, next);
+    if (localServerActiveRef.current) {
+      const res = await toggleLocalServerUserActive(userId, nextActive);
+      if (!res.ok) {
+        showToast(res.error || t.toast.supabaseError, 'error');
+        return;
+      }
+      setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, isActive: nextActive } : u)));
+    }
   };
 
   const handleReassignOwner = async (
@@ -1090,8 +1200,150 @@ function SmartMenuShell() {
       }
     }
 
-    await persistLocal('reassign_owner', restaurants, categories, menuItems, nextUsers);
-    return true;
+    if (localServerActiveRef.current) {
+      const res = await reassignLocalServerOwner(userId, restaurantId);
+      if (!res.ok) {
+        showToast(res.error || t.toast.supabaseError, 'error');
+        return false;
+      }
+      setUsers(nextUsers);
+      return true;
+    }
+
+    return false;
+  };
+
+  const handleResetUserPassword = async (
+    userId: string,
+    newPassword: string
+  ): Promise<boolean> => {
+    try {
+      assertAuthorized(canManageAccounts(currentProUserRef.current));
+    } catch (err) {
+      if (err instanceof PermissionError) {
+        showToast(t.toast.permissionDenied, 'error');
+        return false;
+      }
+      throw err;
+    }
+
+    if (newPassword.length < 4) {
+      showToast(t.auth.passwordTooShort, 'error');
+      return false;
+    }
+
+    if (isSupabaseEnvConfigured()) {
+      try {
+        const sb = await loadSupabaseData();
+        await sb.resetUserPasswordInSupabase(userId, newPassword);
+        return true;
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : t.toast.supabaseError, 'error');
+        return false;
+      }
+    }
+
+    if (localServerActiveRef.current) {
+      const res = await resetLocalServerUserPassword(userId, newPassword);
+      if (!res.ok) {
+        showToast(res.error || t.toast.supabaseError, 'error');
+        return false;
+      }
+      return true;
+    }
+
+    showToast(t.auth.noBackendBody, 'error');
+    return false;
+  };
+
+  const handleUpdateOwnCredentials = async (payload: {
+    username: string;
+    email?: string;
+    password?: string;
+    name?: string;
+  }): Promise<PlatformUser | null> => {
+    try {
+      assertAuthorized(canManageAccounts(currentProUserRef.current));
+    } catch (err) {
+      if (err instanceof PermissionError) {
+        showToast(t.toast.permissionDenied, 'error');
+        return null;
+      }
+      throw err;
+    }
+
+    if (isSupabaseEnvConfigured()) {
+      try {
+        const sb = await loadSupabaseData();
+        const updated = await sb.updateOwnSupabaseCredentials(payload);
+        sb.invalidateSupabaseCatalogCache();
+        setCurrentProUser(updated);
+        setUsers((prev) => {
+          const exists = prev.some((u) => u.id === updated.id);
+          return exists ? prev.map((u) => (u.id === updated.id ? updated : u)) : [updated, ...prev];
+        });
+        return updated;
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : t.toast.supabaseError, 'error');
+        return null;
+      }
+    }
+
+    if (localServerActiveRef.current) {
+      const res = await updateOwnLocalCredentials(payload);
+      if (!res.ok || !res.user) {
+        showToast(res.error || t.toast.supabaseError, 'error');
+        return null;
+      }
+      setCurrentProUser(res.user);
+      setUsers((prev) => prev.map((u) => (u.id === res.user!.id ? res.user! : u)));
+      return res.user;
+    }
+
+    return null;
+  };
+
+  const handleChangeOwnPassword = async (
+    currentPassword: string,
+    newPassword: string
+  ): Promise<boolean> => {
+    try {
+      assertAuthorized(Boolean(currentProUserRef.current?.isActive));
+    } catch (err) {
+      if (err instanceof PermissionError) {
+        showToast(t.toast.permissionDenied, 'error');
+        return false;
+      }
+      throw err;
+    }
+
+    if (newPassword.length < 4) {
+      showToast(t.auth.passwordTooShort, 'error');
+      return false;
+    }
+
+    if (isSupabaseEnvConfigured()) {
+      try {
+        const sb = await loadSupabaseData();
+        await sb.changeOwnSupabasePassword(currentPassword, newPassword);
+        return true;
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : t.toast.supabaseError, 'error');
+        return false;
+      }
+    }
+
+    if (localServerActiveRef.current) {
+      const res = await changeOwnLocalPassword(currentPassword, newPassword);
+      if (!res.ok) {
+        showToast(res.error || t.toast.supabaseError, 'error');
+        return false;
+      }
+      return true;
+    }
+
+    showToast(t.auth.noBackendBody, 'error');
+    return false;
   };
 
   const handleSaveMenuItem = async (item: MenuItem, isNew: boolean) => {
@@ -1382,23 +1634,6 @@ function SmartMenuShell() {
     await persistLocal('delete_category', restaurants, nextCategories, menuItems, users);
   };
 
-  const handleResetDemo = async () => {
-    if (isSupabaseEnvConfigured()) {
-      await refreshFromSupabase(true);
-      return;
-    }
-    const fresh = await resetPlatformState();
-    setRestaurants(fresh.restaurants);
-    setCategories(fresh.categories);
-    setMenuItems(fresh.menuItems);
-    setUsers(fresh.users);
-    setUpdatedAt(fresh.updatedAt);
-    setBaseUpdatedAt(fresh.updatedAt);
-    setPendingCount(0);
-    setConflictServerState(null);
-    handleSelectRestaurant('rocomamas-lubumbashi');
-  };
-
   return (
     <div className="min-h-screen bg-[#09090B] text-zinc-100 flex flex-col">
       <Navbar activeView={activeView} onNavigateView={handleNavigateView} />
@@ -1534,14 +1769,20 @@ function SmartMenuShell() {
             menuItems={menuItems}
             users={users}
             activeRestaurantId={activeRestaurant?.id ?? activeRestaurantId}
+            initialRecoveryMode={passwordRecoveryPending}
+            onRecoveryComplete={() => setPasswordRecoveryPending(false)}
             onSelectRestaurant={handleSelectRestaurant}
             onAddRestaurant={handleAddRestaurant}
             onUpdateRestaurant={handleUpdateRestaurant}
             onToggleRestaurantStatus={handleToggleRestaurantStatus}
             onDeleteRestaurant={handleDeleteRestaurant}
             onCreateOwnerAccount={handleCreateOwnerAccount}
+            onUpdateOwnerProfile={handleUpdateOwnerProfile}
             onToggleUserActive={handleToggleUserActive}
             onReassignOwner={handleReassignOwner}
+            onResetUserPassword={handleResetUserPassword}
+            onUpdateOwnCredentials={handleUpdateOwnCredentials}
+            onChangeOwnPassword={handleChangeOwnPassword}
             onSaveMenuItem={handleSaveMenuItem}
             onDeleteMenuItem={handleDeleteMenuItem}
             onToggleAvailability={handleToggleAvailability}
@@ -1553,9 +1794,19 @@ function SmartMenuShell() {
               handleSelectRestaurant(id);
               handleNavigateView('customer', 'top');
             }}
-            onResetDemo={handleResetDemo}
             onRefreshCloud={() => refreshFromSupabase(true)}
-            onAuthSessionChanged={() => refreshFromSupabase(true)}
+            onAuthSessionChanged={async (user) => {
+              if (isSupabaseEnvConfigured()) {
+                await refreshFromSupabase(true);
+              } else if (localServerActiveRef.current) {
+                if (user?.role === 'super_admin') {
+                  const localUsers = await listLocalServerUsers();
+                  setUsers(localUsers);
+                } else if (!user) {
+                  setUsers([]);
+                }
+              }
+            }}
             localServerActive={localServerActive}
             localAuthRequired={localAuthRequired}
             onAuthUserChange={setCurrentProUser}

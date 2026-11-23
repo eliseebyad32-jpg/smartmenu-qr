@@ -1,7 +1,24 @@
 import { Category, MenuItem, PlatformUser, Restaurant } from '../types/menu';
-import { createEphemeralSupabaseClient, getSupabaseClient } from './supabaseClient';
+import { getSupabaseClient } from './supabaseClient';
 
 export const RESTAURANT_ASSETS_BUCKET = 'restaurant-assets';
+
+// Custom PostgreSQL session token kept strictly in JS memory (never localStorage/sessionStorage)
+let memorySupabaseSessionToken: string | null = null;
+
+export function getSupabaseAppSessionToken(): string | null {
+  return memorySupabaseSessionToken;
+}
+
+export function clearSupabaseAppSessionToken(): void {
+  memorySupabaseSessionToken = null;
+}
+
+function isRpcMissingError(err: { code?: string; message?: string } | null | undefined): boolean {
+  if (!err) return false;
+  const msg = String(err.message || '');
+  return err.code === 'PGRST202' || err.code === '42883' || msg.includes('Could not find the function');
+}
 
 interface DbRestaurantRow {
   id: string;
@@ -33,6 +50,7 @@ interface DbRestaurantRow {
 
 interface DbProfileRow {
   id: string;
+  username?: string | null;
   full_name: string;
   email: string;
   role: 'super_admin' | 'restaurateur';
@@ -97,7 +115,14 @@ function mapRowToRestaurant(row: DbRestaurantRow): Restaurant {
   };
 }
 
-function mapRestaurantToRow(rest: Restaurant): Omit<DbRestaurantRow, 'owner_id'> & { owner_id?: string | null } {
+function isUuid(val: string | undefined | null): boolean {
+  if (!val) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(val);
+}
+
+function mapRestaurantToRow(
+  rest: Restaurant
+): Omit<DbRestaurantRow, 'owner_id'> & { owner_id?: string | null } {
   const row: Omit<DbRestaurantRow, 'owner_id'> & { owner_id?: string | null } = {
     id: rest.id,
     slug: rest.slug,
@@ -127,11 +152,6 @@ function mapRestaurantToRow(rest: Restaurant): Omit<DbRestaurantRow, 'owner_id'>
     row.owner_id = rest.ownerId;
   }
   return row;
-}
-
-function isUuid(val: string | undefined | null): boolean {
-  if (!val) return false;
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(val);
 }
 
 function mapRowToCategory(row: DbCategoryRow): Category {
@@ -177,11 +197,14 @@ function mapProfileToPlatformUser(row: DbProfileRow): PlatformUser {
       ? row.is_active
       : String(row.is_active).trim().toLowerCase() === 'true';
 
+  const username = (row.username || row.email || '').trim();
+  const email = (row.email || '').trim();
+
   return {
     id: row.id,
-    name: (row.full_name || row.email || '').trim(),
-    email: (row.email || '').trim(),
-    password: '',
+    username,
+    name: (row.full_name || username || email).trim(),
+    ...(email ? { email } : {}),
     role: normalizedRole,
     assignedRestaurantId: row.restaurant_id ?? null,
     isActive,
@@ -197,10 +220,10 @@ export interface SupabaseCatalogResult {
 
 const RESTAURANT_COLUMNS =
   'id,slug,name,city,country_fr,country_en,address_fr,address_en,hours_fr,hours_en,phone,tagline_fr,tagline_en,description_fr,description_en,demo_disclaimer_fr,demo_disclaimer_en,hero_image,logo_url,primary_color,secondary_color,is_active,is_demo,owner_id,updated_at';
-const CATEGORY_COLUMNS = 'id,restaurant_id,name_fr,name_en,description_fr,description_en,sort_order';
+const CATEGORY_COLUMNS =
+  'id,restaurant_id,name_fr,name_en,description_fr,description_en,sort_order';
 const MENU_ITEM_COLUMNS =
   'id,restaurant_id,category_id,name_fr,name_en,description_fr,description_en,ingredients_fr,ingredients_en,price_fc,image_url,is_available,is_popular,is_specialty,spice_level,prep_minutes,updated_at';
-const PROFILE_COLUMNS = 'id,full_name,email,role,restaurant_id,is_active';
 
 const CATALOG_CACHE_TTL_MS = 10_000;
 let inFlightCatalogFetch: Promise<SupabaseCatalogResult> | null = null;
@@ -224,7 +247,7 @@ export async function fetchSupabaseCatalog(force = false): Promise<SupabaseCatal
     return lastCatalogCache.result;
   }
 
-  if (inFlightCatalogFetch) {
+  if (!force && inFlightCatalogFetch) {
     return inFlightCatalogFetch;
   }
 
@@ -247,13 +270,20 @@ export async function fetchSupabaseCatalog(force = false): Promise<SupabaseCatal
     if (itemRes.error) throw itemRes.error;
 
     let users: PlatformUser[] | undefined;
-    if (sessionRes.data.session?.user) {
-      const profRes = await supabase
-        .from('profiles')
-        .select(PROFILE_COLUMNS)
-        .order('created_at', { ascending: true });
-      if (!profRes.error && profRes.data) {
-        users = (profRes.data as DbProfileRow[]).map(mapProfileToPlatformUser);
+    if (memorySupabaseSessionToken || sessionRes.data.session?.user) {
+      const rpcRes = await supabase.rpc('admin_list_profiles', {
+        p_session_token: memorySupabaseSessionToken,
+      });
+      if (!rpcRes.error && Array.isArray(rpcRes.data)) {
+        users = (rpcRes.data as DbProfileRow[]).map(mapProfileToPlatformUser);
+      } else if (isRpcMissingError(rpcRes.error) && sessionRes.data.session?.user) {
+        const profRes = await supabase
+          .from('profiles')
+          .select('id,full_name,email,role,restaurant_id,is_active')
+          .order('created_at', { ascending: true });
+        if (!profRes.error && profRes.data) {
+          users = (profRes.data as DbProfileRow[]).map(mapProfileToPlatformUser);
+        }
       }
     }
 
@@ -322,12 +352,14 @@ export type AuthFailureReason =
   | 'profile_missing'
   | 'profile_error'
   | 'id_mismatch'
-  | 'inactive';
+  | 'inactive'
+  | 'locked';
 
 export interface SupabaseAuthResult {
   user: PlatformUser | null;
   reason?: AuthFailureReason;
   errorDetail?: string;
+  retryAfterSeconds?: number;
 }
 
 function formatSupabaseError(err: { code?: string; message?: string; hint?: string }): string {
@@ -335,31 +367,94 @@ function formatSupabaseError(err: { code?: string; message?: string; hint?: stri
   return parts.join(' — ');
 }
 
-async function resolveProfileForAuthUser(
-  authUser: { id: string; email?: string | null }
-): Promise<SupabaseAuthResult> {
+export async function fetchSupabaseBootstrapStatus(): Promise<{
+  hasSuperAdmin: boolean;
+  rpcReady: boolean;
+}> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return { hasSuperAdmin: false, rpcReady: false };
+
+  const { data, error } = await supabase.rpc('get_auth_bootstrap_status');
+  if (error) {
+    // If schema.sql hasn't been re-run yet, default safely to login form
+    return { hasSuperAdmin: true, rpcReady: false };
+  }
+
+  const parsed = data as { has_super_admin?: boolean } | null;
+  return {
+    hasSuperAdmin: Boolean(parsed?.has_super_admin),
+    rpcReady: true,
+  };
+}
+
+export async function setupSupabaseInitialSuperAdmin(payload: {
+  username: string;
+  name: string;
+  password: string;
+  email?: string;
+}): Promise<{ ok: boolean; user?: PlatformUser; error?: string }> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return { ok: false, error: 'Supabase client is not configured' };
+  }
+
+  const { data, error } = await supabase.rpc('setup_initial_super_admin', {
+    p_username: payload.username.trim(),
+    p_full_name: payload.name.trim(),
+    p_password: payload.password,
+    p_email: payload.email?.trim() || '',
+  });
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+
+  const body = data as { ok?: boolean; token?: string; user?: DbProfileRow } | null;
+  if (!body?.ok || !body.token || !body.user) {
+    return { ok: false, error: 'Impossible de créer le compte Super Admin.' };
+  }
+
+  memorySupabaseSessionToken = body.token;
+  return { ok: true, user: mapProfileToPlatformUser(body.user) };
+}
+
+async function resolveProfileForAuthUser(authUser: {
+  id: string;
+  email?: string | null;
+}): Promise<SupabaseAuthResult> {
   const supabase = getSupabaseClient();
   if (!supabase) {
     return { user: null, reason: 'invalid_credentials' };
   }
 
-  // 1. Primary lookup by primary key: public.profiles.id = auth.users.id
   const { data: byIdRows, error: byIdError } = await supabase
     .from('profiles')
-    .select('id, full_name, email, role, restaurant_id, is_active')
+    .select('id, username, full_name, email, role, restaurant_id, is_active')
     .eq('id', authUser.id)
     .limit(1);
 
   if (byIdError) {
-    console.error('[SmartMenu QR] Error fetching public.profiles by id:', byIdError);
-    return {
-      user: null,
-      reason: 'profile_error',
-      errorDetail: formatSupabaseError(byIdError),
-    };
-  }
+    // Retry without username column if schema upgrade hasn't been applied yet
+    const fallbackRes = await supabase
+      .from('profiles')
+      .select('id, full_name, email, role, restaurant_id, is_active')
+      .eq('id', authUser.id)
+      .limit(1);
 
-  if (byIdRows && byIdRows.length > 0) {
+    if (fallbackRes.error) {
+      return {
+        user: null,
+        reason: 'profile_error',
+        errorDetail: formatSupabaseError(fallbackRes.error),
+      };
+    }
+
+    if (fallbackRes.data && fallbackRes.data.length > 0) {
+      const mapped = mapProfileToPlatformUser(fallbackRes.data[0] as DbProfileRow);
+      if (!mapped.isActive) return { user: null, reason: 'inactive' };
+      return { user: mapped };
+    }
+  } else if (byIdRows && byIdRows.length > 0) {
     const mapped = mapProfileToPlatformUser(byIdRows[0] as DbProfileRow);
     if (!mapped.isActive) {
       return { user: null, reason: 'inactive' };
@@ -367,7 +462,6 @@ async function resolveProfileForAuthUser(
     return { user: mapped };
   }
 
-  // 2. Fallback check by email to detect auth.users.id <-> public.profiles.id mismatch
   const normalizedEmail = authUser.email?.trim().toLowerCase();
   if (normalizedEmail) {
     const { data: byEmailRows, error: byEmailError } = await supabase
@@ -377,7 +471,6 @@ async function resolveProfileForAuthUser(
       .limit(5);
 
     if (byEmailError) {
-      console.error('[SmartMenu QR] Error checking public.profiles by email:', byEmailError);
       return {
         user: null,
         reason: 'profile_error',
@@ -405,6 +498,16 @@ export async function fetchCurrentSupabaseUser(): Promise<PlatformUser | null> {
   const supabase = getSupabaseClient();
   if (!supabase) return null;
 
+  if (memorySupabaseSessionToken) {
+    const { data, error } = await supabase.rpc('get_session_user', {
+      p_session_token: memorySupabaseSessionToken,
+    });
+    if (!error && data) {
+      return mapProfileToPlatformUser(data as DbProfileRow);
+    }
+    memorySupabaseSessionToken = null;
+  }
+
   const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
   if (sessionErr || !sessionData.session?.user) {
     return null;
@@ -415,7 +518,7 @@ export async function fetchCurrentSupabaseUser(): Promise<PlatformUser | null> {
 }
 
 export async function signInWithSupabase(
-  email: string,
+  identifier: string,
   password: string
 ): Promise<SupabaseAuthResult> {
   const supabase = getSupabaseClient();
@@ -423,28 +526,206 @@ export async function signInWithSupabase(
     return { user: null, reason: 'invalid_credentials' };
   }
 
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email: email.trim(),
-    password,
+  const trimmed = identifier.trim();
+  const { data: rpcData, error: rpcError } = await supabase.rpc('login_with_identifier', {
+    p_identifier: trimmed,
+    p_password: password,
   });
 
-  if (error || !data.user) {
-    return { user: null, reason: 'invalid_credentials' };
+  if (!rpcError && rpcData) {
+    const res = rpcData as {
+      ok?: boolean;
+      token?: string;
+      user?: DbProfileRow;
+      reason?: string;
+      retry_after_seconds?: number;
+    };
+
+    if (res.ok && res.token && res.user) {
+      memorySupabaseSessionToken = res.token;
+      const mapped = mapProfileToPlatformUser(res.user);
+      if (!mapped.isActive) {
+        memorySupabaseSessionToken = null;
+        return { user: null, reason: 'inactive' };
+      }
+      return { user: mapped };
+    }
+
+    if (res.reason === 'locked') {
+      return {
+        user: null,
+        reason: 'locked',
+        retryAfterSeconds: res.retry_after_seconds,
+      };
+    }
+
+    if (res.reason === 'inactive') {
+      return { user: null, reason: 'inactive' };
+    }
   }
 
-  const resolved = await resolveProfileForAuthUser(data.user);
-  if (!resolved.user) {
-    await supabase.auth.signOut();
+  // Fallback / primary flow for Supabase Auth email+password accounts (e.g. eliseebyad32@gmail.com)
+  if (trimmed.includes('@')) {
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: trimmed,
+      password,
+    });
+
+    if (error || !data.user) {
+      return { user: null, reason: 'invalid_credentials' };
+    }
+
+    const resolved = await resolveProfileForAuthUser(data.user);
+    if (!resolved.user) {
+      await supabase.auth.signOut();
+      return resolved;
+    }
+
     return resolved;
   }
 
-  return resolved;
+  return { user: null, reason: 'invalid_credentials' };
 }
 
 export async function signOutSupabase(): Promise<void> {
   const supabase = getSupabaseClient();
+  const token = memorySupabaseSessionToken;
+  memorySupabaseSessionToken = null;
+
   if (!supabase) return;
+  if (token) {
+    try {
+      await supabase.rpc('logout_session', { p_session_token: token });
+    } catch {
+      // Ignore logout RPC failure
+    }
+  }
   await supabase.auth.signOut();
+}
+
+export async function requestSupabasePasswordReset(
+  email: string
+): Promise<{ ok: boolean; error?: string }> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return { ok: false, error: 'Supabase client is not configured' };
+  }
+
+  const cleanEmail = email.trim();
+  if (!cleanEmail || !cleanEmail.includes('@')) {
+    return { ok: false, error: 'Veuillez saisir une adresse e-mail valide.' };
+  }
+
+  const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
+    redirectTo: typeof window !== 'undefined' ? window.location.origin : undefined,
+  });
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  return { ok: true };
+}
+
+export async function completeSupabasePasswordRecovery(newPassword: string): Promise<{
+  ok: boolean;
+  user?: PlatformUser;
+  error?: string;
+}> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return { ok: false, error: 'Supabase client is not configured' };
+  }
+
+  const { data, error } = await supabase.auth.updateUser({ password: newPassword });
+  if (error || !data.user) {
+    return {
+      ok: false,
+      error: error?.message || 'Impossible de mettre à jour le mot de passe.',
+    };
+  }
+
+  const resolved = await resolveProfileForAuthUser(data.user);
+  if (!resolved.user) {
+    return {
+      ok: false,
+      error: resolved.errorDetail || 'Profil Super Admin introuvable après récupération.',
+    };
+  }
+
+  if (resolved.user.role === 'super_admin') {
+    try {
+      await supabase.rpc('update_own_credentials', {
+        p_username: resolved.user.username || data.user.email || 'admin',
+        p_new_password: newPassword,
+        p_full_name: resolved.user.name || null,
+        p_email: resolved.user.email ? null : data.user.email || null,
+        p_session_token: memorySupabaseSessionToken,
+      });
+    } catch {
+      // Auth password already succeeded; ignore if RPC schema upgrade isn't applied yet
+    }
+  }
+
+  return { ok: true, user: resolved.user };
+}
+
+export async function updateOwnSupabaseCredentials(payload: {
+  username: string;
+  email?: string;
+  password?: string;
+  name?: string;
+}): Promise<PlatformUser> {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase not configured');
+
+  const { data, error } = await supabase.rpc('update_own_credentials', {
+    p_username: payload.username.trim(),
+    p_new_password: payload.password || null,
+    p_full_name: payload.name?.trim() || null,
+    p_email: payload.email !== undefined ? payload.email.trim() : null,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (error || !data) {
+    throw error || new Error('Impossible de mettre à jour les identifiants');
+  }
+
+  // Keep linked Supabase Auth password in sync when logged in via Supabase Auth session
+  try {
+    const { data: sessionRes } = await supabase.auth.getSession();
+    if (sessionRes.session?.user && payload.password && payload.password.length >= 6) {
+      await supabase.auth.updateUser({ password: payload.password });
+    }
+  } catch {
+    // Custom credentials hash was saved safely; ignore optional Auth sync warnings
+  }
+
+  return mapProfileToPlatformUser(data as DbProfileRow);
+}
+
+export async function changeOwnSupabasePassword(
+  currentPassword: string,
+  newPassword: string
+): Promise<void> {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase not configured');
+
+  const { error } = await supabase.rpc('change_own_password', {
+    p_current_password: currentPassword,
+    p_new_password: newPassword,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (error) throw error;
+
+  try {
+    const { data: sessionRes } = await supabase.auth.getSession();
+    if (sessionRes.session?.user && newPassword.length >= 6) {
+      await supabase.auth.updateUser({ password: newPassword });
+    }
+  } catch {
+    // Primary password hash already updated securely in PostgreSQL
+  }
 }
 
 export async function upsertRestaurantInSupabase(
@@ -455,6 +736,19 @@ export async function upsertRestaurantInSupabase(
   if (!supabase) throw new Error('Supabase not configured');
 
   const row = mapRestaurantToRow(restaurant);
+  const { data: rpcData, error: rpcError } = await supabase.rpc('admin_upsert_restaurant', {
+    p_row: row,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcError && rpcData) {
+    return mapRowToRestaurant(rpcData as DbRestaurantRow);
+  }
+
+  if (!isRpcMissingError(rpcError) || memorySupabaseSessionToken) {
+    throw rpcError;
+  }
+
   if (isNew) {
     const { data, error } = await supabase
       .from('restaurants')
@@ -481,6 +775,18 @@ export async function toggleRestaurantStatusInSupabase(
 ): Promise<void> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
+
+  const { error: rpcError } = await supabase.rpc('admin_toggle_restaurant_status', {
+    p_restaurant_id: restaurantId,
+    p_is_active: isActive,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcError) return;
+  if (!isRpcMissingError(rpcError) || memorySupabaseSessionToken) {
+    throw rpcError;
+  }
+
   const { error } = await supabase
     .from('restaurants')
     .update({ is_active: isActive })
@@ -490,45 +796,44 @@ export async function toggleRestaurantStatusInSupabase(
 
 export async function createOwnerAccountInSupabase(payload: {
   name: string;
-  email: string;
+  username: string;
   password: string;
   restaurantId: string;
+  email?: string;
 }): Promise<PlatformUser> {
   const supabase = getSupabaseClient();
-  const ephemeral = createEphemeralSupabaseClient();
-  if (!supabase || !ephemeral) throw new Error('Supabase not configured');
+  if (!supabase) throw new Error('Supabase not configured');
 
-  const { data: signUpData, error: signUpError } = await ephemeral.auth.signUp({
-    email: payload.email.trim(),
-    password: payload.password,
-    options: {
-      data: {
-        full_name: payload.name.trim(),
-      },
-    },
+  const { data, error } = await supabase.rpc('admin_create_restaurateur', {
+    p_username: payload.username.trim(),
+    p_full_name: payload.name.trim(),
+    p_password: payload.password,
+    p_restaurant_id: payload.restaurantId,
+    p_email: payload.email?.trim() || '',
+    p_session_token: memorySupabaseSessionToken,
   });
 
-  if (signUpError || !signUpData.user?.id) {
-    throw signUpError || new Error('Unable to register auth user');
+  if (error || !data) {
+    throw error || new Error('Impossible de créer le compte restaurateur');
   }
 
-  const profileRow: DbProfileRow = {
-    id: signUpData.user.id,
-    full_name: payload.name.trim(),
-    email: payload.email.trim(),
-    role: 'restaurateur',
-    restaurant_id: payload.restaurantId,
-    is_active: true,
-  };
+  return mapProfileToPlatformUser(data as DbProfileRow);
+}
 
-  const { data: inserted, error: profError } = await supabase
-    .from('profiles')
-    .upsert(profileRow)
-    .select()
-    .single();
+export async function resetUserPasswordInSupabase(
+  userId: string,
+  newPassword: string
+): Promise<void> {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase not configured');
 
-  if (profError) throw profError;
-  return mapProfileToPlatformUser(inserted as DbProfileRow);
+  const { error } = await supabase.rpc('admin_reset_user_password', {
+    p_user_id: userId,
+    p_new_password: newPassword,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (error) throw error;
 }
 
 export async function deleteRestaurantInSupabase(restaurantId: string): Promise<void> {
@@ -537,10 +842,20 @@ export async function deleteRestaurantInSupabase(restaurantId: string): Promise<
 
   const { error: rpcErr } = await supabase.rpc('delete_restaurant_cascade', {
     target_restaurant_id: restaurantId,
+    p_session_token: memorySupabaseSessionToken,
   });
   if (!rpcErr) return;
 
-  // Fallback sequence if the SQL RPC function has not been deployed on the remote DB yet
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
+  }
+
+  // Fallback sequence if the older 1-arg RPC exists without session param
+  const { error: legacyRpcErr } = await supabase.rpc('delete_restaurant_cascade', {
+    target_restaurant_id: restaurantId,
+  });
+  if (!legacyRpcErr) return;
+
   const { error: itemsErr } = await supabase
     .from('menu_items')
     .delete()
@@ -569,6 +884,18 @@ export async function toggleUserProfileActiveInSupabase(
 ): Promise<void> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
+
+  const { error: rpcErr } = await supabase.rpc('admin_toggle_user_active', {
+    p_user_id: userId,
+    p_is_active: isActive,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcErr) return;
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
+  }
+
   const { error } = await supabase
     .from('profiles')
     .update({ is_active: isActive })
@@ -582,6 +909,18 @@ export async function reassignOwnerRestaurantInSupabase(
 ): Promise<void> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
+
+  const { error: rpcErr } = await supabase.rpc('admin_reassign_owner', {
+    p_user_id: userId,
+    p_restaurant_id: restaurantId,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcErr) return;
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
+  }
+
   const { error } = await supabase
     .from('profiles')
     .update({ restaurant_id: restaurantId })
@@ -589,23 +928,62 @@ export async function reassignOwnerRestaurantInSupabase(
   if (error) throw error;
 }
 
+export async function updateOwnerProfileInSupabase(payload: {
+  userId: string;
+  username: string;
+  name: string;
+  email?: string;
+  restaurantId: string | null;
+}): Promise<PlatformUser> {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase not configured');
+
+  const { data, error } = await supabase.rpc('admin_update_profile', {
+    p_user_id: payload.userId,
+    p_username: payload.username.trim(),
+    p_full_name: payload.name.trim(),
+    p_email: payload.email?.trim() || '',
+    p_restaurant_id: payload.restaurantId,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (error || !data) {
+    throw error || new Error('Impossible de mettre à jour le profil.');
+  }
+
+  return mapProfileToPlatformUser(data as DbProfileRow);
+}
+
 export async function insertCategoryInSupabase(category: Category): Promise<Category> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
+
+  const row = {
+    id: category.id,
+    restaurant_id: category.restaurantId ?? null,
+    name_fr: category.name.fr,
+    name_en: category.name.en,
+    description_fr: category.description.fr || '',
+    description_en: category.description.en || '',
+    sort_order: category.order,
+  };
+
+  const { data: rpcData, error: rpcErr } = await supabase.rpc('manage_upsert_category', {
+    p_row: row,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcErr && rpcData) {
+    return mapRowToCategory(rpcData as DbCategoryRow);
+  }
+
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
+  }
+
   const { data, error } = await supabase
     .from('categories')
-    .upsert(
-      {
-        id: category.id,
-        restaurant_id: category.restaurantId ?? null,
-        name_fr: category.name.fr,
-        name_en: category.name.en,
-        description_fr: category.description.fr || '',
-        description_en: category.description.en || '',
-        sort_order: category.order,
-      },
-      { onConflict: 'id' }
-    )
+    .upsert(row, { onConflict: 'id' })
     .select()
     .single();
   if (error) throw error;
@@ -615,6 +993,30 @@ export async function insertCategoryInSupabase(category: Category): Promise<Cate
 export async function updateCategoryInSupabase(category: Category): Promise<Category> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
+
+  const row = {
+    id: category.id,
+    restaurant_id: category.restaurantId ?? null,
+    name_fr: category.name.fr,
+    name_en: category.name.en,
+    description_fr: category.description.fr || '',
+    description_en: category.description.en || '',
+    sort_order: category.order,
+  };
+
+  const { data: rpcData, error: rpcErr } = await supabase.rpc('manage_upsert_category', {
+    p_row: row,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcErr && rpcData) {
+    return mapRowToCategory(rpcData as DbCategoryRow);
+  }
+
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
+  }
+
   const { data, error } = await supabase
     .from('categories')
     .update({
@@ -634,13 +1036,24 @@ export async function updateCategoryInSupabase(category: Category): Promise<Cate
 export async function deleteCategoryInSupabase(categoryId: string): Promise<void> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
+
+  const { error: rpcErr } = await supabase.rpc('manage_delete_category', {
+    p_category_id: categoryId,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcErr) return;
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
+  }
+
   const { error } = await supabase.from('categories').delete().eq('id', categoryId);
   if (error) throw error;
 }
 
 export async function upsertMenuItemInSupabase(
   item: MenuItem,
-  isNew: boolean
+  _isNew: boolean
 ): Promise<MenuItem> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
@@ -664,14 +1077,17 @@ export async function upsertMenuItemInSupabase(
     prep_minutes: item.prepMinutes ?? 12,
   };
 
-  if (isNew) {
-    const { data, error } = await supabase
-      .from('menu_items')
-      .upsert(row, { onConflict: 'id' })
-      .select()
-      .single();
-    if (error) throw error;
-    return mapRowToMenuItem(data as DbMenuItemRow);
+  const { data: rpcData, error: rpcErr } = await supabase.rpc('manage_upsert_menu_item', {
+    p_row: row,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcErr && rpcData) {
+    return mapRowToMenuItem(rpcData as DbMenuItemRow);
+  }
+
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
   }
 
   const { data, error } = await supabase
@@ -686,6 +1102,17 @@ export async function upsertMenuItemInSupabase(
 export async function deleteMenuItemInSupabase(itemId: string): Promise<void> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
+
+  const { error: rpcErr } = await supabase.rpc('manage_delete_menu_item', {
+    p_item_id: itemId,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcErr) return;
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
+  }
+
   const { error } = await supabase.from('menu_items').delete().eq('id', itemId);
   if (error) throw error;
 }
@@ -696,6 +1123,18 @@ export async function toggleMenuItemAvailabilityInSupabase(
 ): Promise<void> {
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase not configured');
+
+  const { error: rpcErr } = await supabase.rpc('manage_toggle_item_availability', {
+    p_item_id: itemId,
+    p_is_available: isAvailable,
+    p_session_token: memorySupabaseSessionToken,
+  });
+
+  if (!rpcErr) return;
+  if (!isRpcMissingError(rpcErr) || memorySupabaseSessionToken) {
+    throw rpcErr;
+  }
+
   const { error } = await supabase
     .from('menu_items')
     .update({ is_available: isAvailable })

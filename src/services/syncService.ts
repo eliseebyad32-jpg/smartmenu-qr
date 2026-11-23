@@ -1,4 +1,4 @@
-import { Category, MenuItem, Restaurant } from '../types/menu';
+import { Category, MenuItem, PlatformUser, Restaurant } from '../types/menu';
 import {
   clearOutbox,
   loadOutbox,
@@ -9,36 +9,24 @@ import {
   setLastSyncedAt,
 } from './offlineStore';
 
-const LOCAL_AUTH_TOKEN_KEY = 'smartmenu_qr_local_token_v1';
+const LEGACY_LOCAL_AUTH_TOKEN_KEY = 'smartmenu_qr_local_token_v1';
 let memoryLocalAuthToken: string | null = null;
 
-export function getLocalAuthToken(): string | null {
-  if (memoryLocalAuthToken) return memoryLocalAuthToken;
-  if (typeof window === 'undefined') return null;
+// Purge any legacy browser sessionStorage token on startup
+if (typeof window !== 'undefined') {
   try {
-    const stored = window.sessionStorage.getItem(LOCAL_AUTH_TOKEN_KEY);
-    if (stored) {
-      memoryLocalAuthToken = stored;
-      return stored;
-    }
+    window.sessionStorage.removeItem(LEGACY_LOCAL_AUTH_TOKEN_KEY);
   } catch {
-    // Ignore storage access errors
+    // Ignore storage errors
   }
-  return null;
+}
+
+export function getLocalAuthToken(): string | null {
+  return memoryLocalAuthToken;
 }
 
 function setLocalAuthToken(token: string | null): void {
   memoryLocalAuthToken = token;
-  if (typeof window === 'undefined') return;
-  try {
-    if (token) {
-      window.sessionStorage.setItem(LOCAL_AUTH_TOKEN_KEY, token);
-    } else {
-      window.sessionStorage.removeItem(LOCAL_AUTH_TOKEN_KEY);
-    }
-  } catch {
-    // Ignore storage access errors
-  }
 }
 
 export function clearLocalAuthToken(): void {
@@ -226,15 +214,313 @@ export async function loginLocalServerWithPin(
   }
 }
 
+export interface LocalServerAccountAuthStatus {
+  hasSuperAdmin: boolean;
+  authenticated: boolean;
+  user: PlatformUser | null;
+}
+
+export async function fetchLocalServerAuthStatus(): Promise<LocalServerAccountAuthStatus | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    const res = await fetch('/api/auth/status', {
+      method: 'GET',
+      headers: buildLocalAuthHeaders(),
+      cache: 'no-store',
+    });
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !contentType.includes('application/json')) return null;
+    const data = (await res.json()) as Partial<LocalServerAccountAuthStatus> & { ok?: boolean };
+    if (!data.ok) return null;
+    return {
+      hasSuperAdmin: Boolean(data.hasSuperAdmin),
+      authenticated: Boolean(data.authenticated),
+      user: data.user ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function setupLocalServerSuperAdmin(payload: {
+  username: string;
+  name: string;
+  password: string;
+  email?: string;
+}): Promise<{ ok: boolean; user?: PlatformUser; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/setup-admin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      token?: string;
+      user?: PlatformUser;
+      error?: string;
+    };
+    if (!res.ok || !body.ok || !body.token || !body.user) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    setLocalAuthToken(body.token);
+    return { ok: true, user: body.user };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function loginLocalServerAccount(
+  identifier: string,
+  password: string
+): Promise<{
+  ok: boolean;
+  user?: PlatformUser;
+  error?: string;
+  retryAfterSeconds?: number;
+}> {
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier, password }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      token?: string;
+      user?: PlatformUser;
+      error?: string;
+      retryAfterSeconds?: number;
+    };
+    if (!res.ok || !body.ok || !body.token || !body.user) {
+      return {
+        ok: false,
+        error: body.error || `HTTP ${res.status}`,
+        retryAfterSeconds: body.retryAfterSeconds,
+      };
+    }
+    setLocalAuthToken(body.token);
+    return { ok: true, user: body.user };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function fetchLocalServerCurrentUser(): Promise<PlatformUser | null> {
+  const token = getLocalAuthToken();
+  if (!token) return null;
+  try {
+    const res = await fetch('/api/auth/me', {
+      method: 'GET',
+      headers: buildLocalAuthHeaders(),
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      clearLocalAuthToken();
+      return null;
+    }
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean; user?: PlatformUser };
+    return body.ok && body.user ? body.user : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateOwnLocalCredentials(payload: {
+  username: string;
+  email?: string;
+  password?: string;
+  name?: string;
+}): Promise<{ ok: boolean; user?: PlatformUser; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/change-credentials', {
+      method: 'POST',
+      headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      user?: PlatformUser;
+      error?: string;
+    };
+    if (!res.ok || !body.ok || !body.user) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true, user: body.user };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function changeOwnLocalPassword(
+  currentPassword: string,
+  newPassword: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ currentPassword, newPassword }),
+    });
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    if (!res.ok || !body.ok) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function listLocalServerUsers(): Promise<PlatformUser[]> {
+  try {
+    const res = await fetch('/api/admin/users', {
+      method: 'GET',
+      headers: buildLocalAuthHeaders(),
+      cache: 'no-store',
+    });
+    if (!res.ok) return [];
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean; users?: PlatformUser[] };
+    return body.ok && Array.isArray(body.users) ? body.users : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function createLocalServerOwner(payload: {
+  username: string;
+  name: string;
+  password: string;
+  restaurantId: string;
+  email?: string;
+}): Promise<{ ok: boolean; user?: PlatformUser; error?: string }> {
+  try {
+    const res = await fetch('/api/admin/users', {
+      method: 'POST',
+      headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      user?: PlatformUser;
+      error?: string;
+    };
+    if (!res.ok || !body.ok || !body.user) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true, user: body.user };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function updateLocalServerUser(payload: {
+  userId: string;
+  username: string;
+  name: string;
+  email?: string;
+  restaurantId: string | null;
+}): Promise<{ ok: boolean; user?: PlatformUser; error?: string }> {
+  try {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(payload.userId)}`, {
+      method: 'PATCH',
+      headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        username: payload.username,
+        name: payload.name,
+        email: payload.email,
+        restaurantId: payload.restaurantId,
+      }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      user?: PlatformUser;
+      error?: string;
+    };
+    if (!res.ok || !body.ok || !body.user) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true, user: body.user };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function resetLocalServerUserPassword(
+  userId: string,
+  newPassword: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/password`, {
+      method: 'PATCH',
+      headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ newPassword }),
+    });
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    if (!res.ok || !body.ok) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function toggleLocalServerUserActive(
+  userId: string,
+  isActive: boolean
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/status`, {
+      method: 'PATCH',
+      headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ isActive }),
+    });
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    if (!res.ok || !body.ok) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
+export async function reassignLocalServerOwner(
+  userId: string,
+  restaurantId: string | null
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/restaurant`, {
+      method: 'PATCH',
+      headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ restaurantId }),
+    });
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    if (!res.ok || !body.ok) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
 export async function logoutLocalServer(): Promise<void> {
   const token = getLocalAuthToken();
   clearLocalAuthToken();
   if (!token) return;
   try {
-    await fetch('/api/auth/local-logout', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    await Promise.allSettled([
+      fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      fetch('/api/auth/local-logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+    ]);
   } catch {
     // Token already cleared locally
   }
@@ -290,7 +576,15 @@ async function resolveImageForCloudSync(
   const blob = await response.blob();
   const mime = blob.type || 'image/jpeg';
   const ext = mime.includes('webp') ? 'webp' : mime.includes('png') ? 'png' : 'jpg';
-  return uploadFn(restaurantId, folder, `${entityId}.${ext}`, blob, mime);
+  try {
+    return await uploadFn(restaurantId, folder, `${entityId}.${ext}`, blob, mime);
+  } catch {
+    // Keep optimized inline data URL if Supabase Storage requires an Auth JWT
+    if (rawUrl.startsWith('data:')) {
+      return rawUrl;
+    }
+    throw new Error('Échec de téléversement média vers Storage');
+  }
 }
 
 /**

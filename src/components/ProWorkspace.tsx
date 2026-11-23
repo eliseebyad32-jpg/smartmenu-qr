@@ -5,10 +5,11 @@ import {
   KeyRound,
   Lock,
   LogOut,
+  Mail,
   RefreshCw,
-  RotateCcw,
   ShieldCheck,
   Unlock,
+  UserCog,
 } from 'lucide-react';
 import { useLanguage } from '../context/LanguageContext';
 import { useToast } from '../context/ToastContext';
@@ -17,9 +18,16 @@ import {
   getSupabaseProjectHost,
   isSupabaseConfigured,
 } from '../services/supabaseClient';
-import { fetchCurrentSupabaseUser, signOutSupabase } from '../services/supabaseData';
+import {
+  completeSupabasePasswordRecovery,
+  fetchCurrentSupabaseUser,
+  getSupabaseAppSessionToken,
+  requestSupabasePasswordReset,
+  signOutSupabase,
+} from '../services/supabaseData';
 import {
   fetchLocalAuthStatus,
+  fetchLocalServerCurrentUser,
   LocalAuthStatus,
   loginLocalServerWithPin,
   logoutLocalServer,
@@ -31,14 +39,16 @@ import { AdminDashboard } from './pro/AdminDashboard';
 import { ProAuthGate } from './pro/ProAuthGate';
 import { RestaurateurDashboard } from './pro/RestaurateurDashboard';
 
-const SESSION_KEY = 'smartmenu_qr_pro_user_id';
+const LEGACY_SESSION_KEY = 'smartmenu_qr_pro_user_id';
 const ADMIN_MODE_KEY = 'smartmenu_qr_admin_mode_v1';
 
-function readStoredAdminMode(): 'overview' | 'venue' | 'security' {
+type AdminMode = 'overview' | 'venue' | 'account' | 'security';
+
+function readStoredAdminMode(): AdminMode {
   if (typeof window === 'undefined') return 'overview';
   try {
     const raw = window.localStorage.getItem(ADMIN_MODE_KEY);
-    return raw === 'venue' || raw === 'security' ? raw : 'overview';
+    return raw === 'venue' || raw === 'account' || raw === 'security' ? raw : 'overview';
   } catch {
     return 'overview';
   }
@@ -58,7 +68,8 @@ interface ProWorkspaceProps {
     addressFr: string;
     addressEn: string;
     ownerName: string;
-    ownerEmail: string;
+    ownerEmail?: string;
+    ownerUsername: string;
     ownerPassword: string;
   }) => Promise<boolean> | boolean | void;
   onUpdateRestaurant: (restaurant: Restaurant) => void;
@@ -66,12 +77,28 @@ interface ProWorkspaceProps {
   onDeleteRestaurant: (restaurantId: string) => Promise<boolean> | boolean | void;
   onCreateOwnerAccount: (payload: {
     name: string;
-    email: string;
+    email?: string;
+    username: string;
     password: string;
     restaurantId: string;
   }) => Promise<boolean> | boolean | void;
+  onUpdateOwnerProfile: (payload: {
+    userId: string;
+    username: string;
+    name: string;
+    email?: string;
+    restaurantId: string | null;
+  }) => Promise<PlatformUser | null>;
   onToggleUserActive: (userId: string) => void;
   onReassignOwner: (userId: string, restaurantId: string | null) => Promise<boolean> | boolean | void;
+  onResetUserPassword: (userId: string, newPassword: string) => Promise<boolean>;
+  onUpdateOwnCredentials: (payload: {
+    username: string;
+    email?: string;
+    password?: string;
+    name?: string;
+  }) => Promise<PlatformUser | null>;
+  onChangeOwnPassword: (currentPassword: string, newPassword: string) => Promise<boolean>;
   onSaveMenuItem: (item: MenuItem, isNew: boolean) => void;
   onDeleteMenuItem: (itemId: string) => void;
   onToggleAvailability: (itemId: string) => void;
@@ -80,11 +107,12 @@ interface ProWorkspaceProps {
   onDeleteCategory: (categoryId: string) => void;
   onOpenQr: (restaurant: Restaurant) => void;
   onOpenCustomerMenu: (restaurantId: string) => void;
-  onResetDemo: () => void;
   onRefreshCloud?: () => Promise<void>;
-  onAuthSessionChanged?: () => Promise<void>;
+  onAuthSessionChanged?: (user: PlatformUser | null) => Promise<void> | void;
   localServerActive?: boolean;
   localAuthRequired?: boolean;
+  initialRecoveryMode?: boolean;
+  onRecoveryComplete?: () => void;
   onAuthUserChange?: (user: PlatformUser | null) => void;
   onLocalAuthSuccess?: () => Promise<void>;
 }
@@ -101,8 +129,12 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
   onToggleRestaurantStatus,
   onDeleteRestaurant,
   onCreateOwnerAccount,
+  onUpdateOwnerProfile,
   onToggleUserActive,
   onReassignOwner,
+  onResetUserPassword,
+  onUpdateOwnCredentials,
+  onChangeOwnPassword,
   onSaveMenuItem,
   onDeleteMenuItem,
   onToggleAvailability,
@@ -111,11 +143,12 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
   onDeleteCategory,
   onOpenQr,
   onOpenCustomerMenu,
-  onResetDemo,
   onRefreshCloud,
   onAuthSessionChanged,
   localServerActive = false,
   localAuthRequired = false,
+  initialRecoveryMode = false,
+  onRecoveryComplete,
   onAuthUserChange,
   onLocalAuthSuccess,
 }) => {
@@ -125,23 +158,57 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
   const supabaseReady = isSupabaseConfigured();
   const projectHost = getSupabaseProjectHost();
 
-  const [currentUserId, setCurrentUserId] = useState<string | null>(() => {
-    if (supabaseReady) return null;
-    try {
-      return window.localStorage.getItem(SESSION_KEY);
-    } catch {
-      return null;
-    }
-  });
   const [supabaseUser, setSupabaseUser] = useState<PlatformUser | null>(null);
-  const [checkingSession, setCheckingSession] = useState<boolean>(supabaseReady);
-  const [adminMode, setAdminMode] = useState<'overview' | 'venue' | 'security'>(() =>
-    readStoredAdminMode()
+  const [localAccountUser, setLocalAccountUser] = useState<PlatformUser | null>(null);
+  const [checkingSession, setCheckingSession] = useState<boolean>(
+    supabaseReady || localServerActive
   );
+  const [adminMode, setAdminMode] = useState<AdminMode>(() => readStoredAdminMode());
   const [localAuthStatus, setLocalAuthStatus] = useState<LocalAuthStatus | null>(null);
   const [localPinInput, setLocalPinInput] = useState('');
   const [localPinError, setLocalPinError] = useState('');
   const [localPinBusy, setLocalPinBusy] = useState(false);
+
+  // Supabase Auth Email Recovery flow state
+  const [recoveryMode, setRecoveryMode] = useState<boolean>(() => {
+    if (initialRecoveryMode) return true;
+    if (typeof window === 'undefined') return false;
+    return window.location.hash.includes('type=recovery');
+  });
+
+  useEffect(() => {
+    if (initialRecoveryMode) {
+      setRecoveryMode(true);
+    }
+  }, [initialRecoveryMode]);
+  const [recoveryPassword, setRecoveryPassword] = useState('');
+  const [recoveryConfirm, setRecoveryConfirm] = useState('');
+  const [recoveryError, setRecoveryError] = useState('');
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+
+  // Super Admin Account Settings form state (email is preserved read-only)
+  const [accountUsername, setAccountUsername] = useState('');
+  const [accountName, setAccountName] = useState('');
+  const [accountPassword, setAccountPassword] = useState('');
+  const [accountConfirmPassword, setAccountConfirmPassword] = useState('');
+  const [accountBusy, setAccountBusy] = useState(false);
+  const [accountResetSending, setAccountResetSending] = useState(false);
+
+  // Restaurateur isolated password change panel state
+  const [showOwnerPasswordBox, setShowOwnerPasswordBox] = useState(false);
+  const [ownerCurrentPass, setOwnerCurrentPass] = useState('');
+  const [ownerNewPass, setOwnerNewPass] = useState('');
+  const [ownerConfirmPass, setOwnerConfirmPass] = useState('');
+  const [ownerPassBusy, setOwnerPassBusy] = useState(false);
+
+  // Scrub any legacy localStorage user session ID on startup
+  useEffect(() => {
+    try {
+      window.localStorage.removeItem(LEGACY_SESSION_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+  }, []);
 
   useEffect(() => {
     try {
@@ -153,8 +220,25 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
 
   useEffect(() => {
     if (!supabaseReady) {
-      setCheckingSession(false);
-      return;
+      if (!localServerActive) {
+        setCheckingSession(false);
+        return;
+      }
+      let mounted = true;
+      fetchLocalServerCurrentUser()
+        .then((user) => {
+          if (!mounted) return;
+          setLocalAccountUser(user);
+          if (user?.role === 'restaurateur' && user.assignedRestaurantId) {
+            onSelectRestaurant(user.assignedRestaurantId);
+          }
+        })
+        .finally(() => {
+          if (mounted) setCheckingSession(false);
+        });
+      return () => {
+        mounted = false;
+      };
     }
 
     let mounted = true;
@@ -173,8 +257,14 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
     const supabase = getSupabaseClient();
     const { data: authSub } = supabase
       ? supabase.auth.onAuthStateChange((event, session) => {
+          if (event === 'PASSWORD_RECOVERY') {
+            setRecoveryMode(true);
+            return;
+          }
           if (event === 'SIGNED_OUT' || !session) {
-            setSupabaseUser(null);
+            if (!getSupabaseAppSessionToken()) {
+              setSupabaseUser(null);
+            }
             return;
           }
           fetchCurrentSupabaseUser().then((user) => {
@@ -191,22 +281,20 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
       mounted = false;
       authSub.subscription?.unsubscribe();
     };
-  }, [supabaseReady]);
+  }, [supabaseReady, localServerActive]);
 
-  // Strict security: in browser-local mode (!supabaseReady), never resolve super_admin from IndexedDB/localStorage
-  const currentUser = supabaseReady
-    ? supabaseUser
-    : users.find(
-        (u) =>
-          u.id === currentUserId &&
-          u.isActive &&
-          u.role === 'restaurateur' &&
-          (u.password.length > 0 || u.id === 'user-roco-owner')
-      ) ?? null;
+  const currentUser = supabaseReady ? supabaseUser : localAccountUser;
 
   useEffect(() => {
     onAuthUserChange?.(currentUser);
   }, [currentUser, onAuthUserChange]);
+
+  useEffect(() => {
+    if (currentUser?.role === 'super_admin') {
+      setAccountUsername(currentUser.username || '');
+      setAccountName(currentUser.name || '');
+    }
+  }, [currentUser?.id, currentUser?.username, currentUser?.name, currentUser?.role]);
 
   useEffect(() => {
     if (!localServerActive || !currentUser) {
@@ -222,35 +310,21 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
     };
   }, [localServerActive, currentUser?.id, localAuthRequired]);
 
-  useEffect(() => {
-    if (supabaseReady) return;
-    try {
-      if (currentUserId) {
-        window.localStorage.setItem(SESSION_KEY, currentUserId);
-      } else {
-        window.localStorage.removeItem(SESSION_KEY);
-      }
-    } catch {
-      // Ignore storage errors
-    }
-  }, [currentUserId, supabaseReady]);
-
   const handleAuthenticated = async (user: PlatformUser) => {
     if (supabaseReady) {
       setSupabaseUser(user);
-      if (user.role === 'restaurateur' && user.assignedRestaurantId) {
-        onSelectRestaurant(user.assignedRestaurantId);
-      }
-      if (onAuthSessionChanged) {
-        await onAuthSessionChanged();
-      }
-      return;
+    } else {
+      setLocalAccountUser(user);
     }
 
-    if (user.role !== 'restaurateur') return;
-    setCurrentUserId(user.id);
-    if (user.assignedRestaurantId) {
+    if (user.role === 'restaurateur' && user.assignedRestaurantId) {
       onSelectRestaurant(user.assignedRestaurantId);
+    } else if (user.role === 'super_admin') {
+      setAdminMode('overview');
+    }
+
+    if (onAuthSessionChanged) {
+      await onAuthSessionChanged(user);
     }
   };
 
@@ -262,14 +336,118 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
     if (supabaseReady) {
       await signOutSupabase();
       setSupabaseUser(null);
-      setAdminMode('overview');
-      if (onAuthSessionChanged) {
-        await onAuthSessionChanged();
-      }
+    } else {
+      setLocalAccountUser(null);
+    }
+    setAdminMode('overview');
+    if (onAuthSessionChanged) {
+      await onAuthSessionChanged(null);
+    }
+  };
+
+  const handleRecoverySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setRecoveryError('');
+    if (recoveryPassword.length < 6) {
+      setRecoveryError(
+        language === 'fr'
+          ? 'Pour la récupération par e-mail Supabase, le mot de passe doit contenir au moins 6 caractères.'
+          : 'For Supabase email recovery, the password must be at least 6 characters.'
+      );
       return;
     }
-    setCurrentUserId(null);
-    setAdminMode('overview');
+    if (recoveryPassword !== recoveryConfirm) {
+      setRecoveryError(t.auth.passwordMismatch);
+      return;
+    }
+
+    setRecoveryBusy(true);
+    try {
+      const res = await completeSupabasePasswordRecovery(recoveryPassword);
+      if (!res.ok || !res.user) {
+        setRecoveryError(res.error || t.toast.supabaseError);
+        return;
+      }
+      setRecoveryPassword('');
+      setRecoveryConfirm('');
+      setRecoveryMode(false);
+      onRecoveryComplete?.();
+      if (typeof window !== 'undefined' && window.location.hash.includes('type=recovery')) {
+        window.history.replaceState({}, '', window.location.pathname + window.location.search);
+      }
+      showToast(t.toast.passwordChanged);
+      await handleAuthenticated(res.user);
+      if (res.user.role === 'super_admin') {
+        setAdminMode('account');
+      }
+    } finally {
+      setRecoveryBusy(false);
+    }
+  };
+
+  const handleSaveSuperAdminAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (accountUsername.trim().length < 2) {
+      showToast(t.toast.validationError, 'error');
+      return;
+    }
+    if (accountPassword) {
+      if (accountPassword.length < 4) {
+        showToast(t.auth.passwordTooShort, 'error');
+        return;
+      }
+      if (accountPassword !== accountConfirmPassword) {
+        showToast(t.auth.passwordMismatch, 'error');
+        return;
+      }
+    }
+
+    setAccountBusy(true);
+    try {
+      // Omit email so the Super Admin's existing email address is strictly preserved
+      const updated = await onUpdateOwnCredentials({
+        username: accountUsername.trim().toLowerCase(),
+        ...(accountName.trim() ? { name: accountName.trim() } : {}),
+        ...(accountPassword ? { password: accountPassword } : {}),
+      });
+      if (updated) {
+        if (supabaseReady) {
+          setSupabaseUser(updated);
+        } else {
+          setLocalAccountUser(updated);
+        }
+        setAccountPassword('');
+        setAccountConfirmPassword('');
+        showToast(t.toast.credentialsUpdated);
+      }
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const handleOwnerChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (ownerNewPass.length < 4) {
+      showToast(t.auth.passwordTooShort, 'error');
+      return;
+    }
+    if (ownerNewPass !== ownerConfirmPass) {
+      showToast(t.auth.passwordMismatch, 'error');
+      return;
+    }
+    setOwnerPassBusy(true);
+    try {
+      const ok = await onChangeOwnPassword(ownerCurrentPass, ownerNewPass);
+      if (ok) {
+        setOwnerCurrentPass('');
+        setOwnerNewPass('');
+        setOwnerConfirmPass('');
+        setShowOwnerPasswordBox(false);
+        showToast(t.toast.passwordChanged);
+      }
+    } finally {
+      setOwnerPassBusy(false);
+    }
   };
 
   if (checkingSession) {
@@ -280,10 +458,84 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
     );
   }
 
+  if (recoveryMode) {
+    return (
+      <main className="min-h-[80vh] bg-[#09090B] px-4 py-12 sm:py-20">
+        <div className="mx-auto max-w-xl rounded-2xl bg-[#141418] border border-orange-500/40 p-6 sm:p-8 shadow-2xl space-y-6">
+          <div>
+            <p className="text-xs sm:text-sm font-semibold text-orange-400 tracking-wide">
+              {t.auth.eyebrow}
+            </p>
+            <h1 className="mt-1 font-display text-3xl font-bold text-white tracking-tight">
+              {t.auth.recoveryTitle}
+            </h1>
+            <p className="mt-2 text-sm text-zinc-400 leading-relaxed">{t.auth.recoverySubtitle}</p>
+          </div>
+
+          <form onSubmit={handleRecoverySubmit} className="space-y-4">
+            <div>
+              <label
+                htmlFor="recovery-password"
+                className="block text-xs font-medium text-zinc-300 mb-1.5"
+              >
+                {t.auth.newPasswordLabel}
+              </label>
+              <input
+                id="recovery-password"
+                type="password"
+                required
+                minLength={6}
+                autoComplete="new-password"
+                value={recoveryPassword}
+                onChange={(e) => setRecoveryPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full min-h-[46px] px-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-orange-500"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="recovery-confirm"
+                className="block text-xs font-medium text-zinc-300 mb-1.5"
+              >
+                {t.auth.confirmPasswordLabel}
+              </label>
+              <input
+                id="recovery-confirm"
+                type="password"
+                required
+                minLength={6}
+                autoComplete="new-password"
+                value={recoveryConfirm}
+                onChange={(e) => setRecoveryConfirm(e.target.value)}
+                placeholder="••••••••"
+                className="w-full min-h-[46px] px-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-orange-500"
+              />
+            </div>
+
+            {recoveryError && (
+              <p role="alert" className="text-xs font-medium text-red-400">
+                {recoveryError}
+              </p>
+            )}
+
+            <button
+              type="submit"
+              disabled={recoveryBusy}
+              className="w-full min-h-[48px] rounded-xl bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-500 hover:to-orange-500 disabled:opacity-60 text-sm font-semibold text-white transition cursor-pointer"
+            >
+              {t.auth.saveRecoveryBtn}
+            </button>
+          </form>
+        </div>
+      </main>
+    );
+  }
+
   if (!currentUser) {
     return (
       <main className="min-h-[80vh] bg-[#09090B]">
-        <ProAuthGate users={users} onAuthenticated={handleAuthenticated} />
+        <ProAuthGate localServerActive={localServerActive} onAuthenticated={handleAuthenticated} />
       </main>
     );
   }
@@ -319,7 +571,10 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
             </h1>
             <p className="mt-2 text-sm text-zinc-400">
               {currentUser.name} ·{' '}
-              <span className="font-mono text-zinc-300">{currentUser.email}</span>
+              <span className="font-mono text-zinc-300">
+                {currentUser.username}
+                {currentUser.email ? ` · ${currentUser.email}` : ''}
+              </span>
             </p>
           </div>
 
@@ -340,6 +595,18 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
                 </button>
                 <button
                   type="button"
+                  onClick={() => setAdminMode('account')}
+                  className={`inline-flex items-center gap-1.5 min-h-[42px] px-4 rounded-lg text-xs sm:text-sm font-medium cursor-pointer ${
+                    adminMode === 'account'
+                      ? 'bg-red-600 text-white'
+                      : 'bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-white'
+                  }`}
+                >
+                  <UserCog className="w-4 h-4" aria-hidden="true" />
+                  <span>{t.pro.tabMyAccount}</span>
+                </button>
+                <button
+                  type="button"
                   onClick={() => setAdminMode('security')}
                   className={`inline-flex items-center gap-1.5 min-h-[42px] px-4 rounded-lg text-xs sm:text-sm font-medium cursor-pointer ${
                     adminMode === 'security'
@@ -353,7 +620,18 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
               </>
             )}
 
-            {supabaseReady ? (
+            {currentUser.role === 'restaurateur' && (
+              <button
+                type="button"
+                onClick={() => setShowOwnerPasswordBox((prev) => !prev)}
+                className="inline-flex items-center gap-1.5 min-h-[42px] px-3.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 cursor-pointer"
+              >
+                <KeyRound className="w-3.5 h-3.5 text-orange-400" aria-hidden="true" />
+                <span>{t.pro.changePasswordBtn}</span>
+              </button>
+            )}
+
+            {supabaseReady && (
               <button
                 type="button"
                 onClick={async () => {
@@ -367,18 +645,6 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
                 <RefreshCw className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
                 <span>{t.pro.refreshCloud}</span>
               </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => {
-                  onResetDemo();
-                  showToast(t.toast.demoReset);
-                }}
-                className="inline-flex items-center gap-1.5 min-h-[42px] px-3.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-300 cursor-pointer"
-              >
-                <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>{t.pro.resetDemo}</span>
-              </button>
             )}
 
             <button
@@ -391,6 +657,69 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Isolated Restaurateur Password Change Panel */}
+        {currentUser.role === 'restaurateur' && showOwnerPasswordBox && (
+          <form
+            onSubmit={handleOwnerChangePassword}
+            className="rounded-2xl bg-[#141418] border border-orange-500/40 p-5 grid grid-cols-1 sm:grid-cols-4 gap-3 items-end"
+          >
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1">
+                {t.pro.currentPasswordLabel}
+              </label>
+              <input
+                type="password"
+                required
+                value={ownerCurrentPass}
+                onChange={(e) => setOwnerCurrentPass(e.target.value)}
+                className="w-full min-h-[40px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-xs text-white"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1">
+                {t.auth.newPasswordLabel}
+              </label>
+              <input
+                type="password"
+                required
+                minLength={4}
+                value={ownerNewPass}
+                onChange={(e) => setOwnerNewPass(e.target.value)}
+                className="w-full min-h-[40px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-xs text-white"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1">
+                {t.auth.confirmPasswordLabel}
+              </label>
+              <input
+                type="password"
+                required
+                minLength={4}
+                value={ownerConfirmPass}
+                onChange={(e) => setOwnerConfirmPass(e.target.value)}
+                className="w-full min-h-[40px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-xs text-white"
+              />
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button
+                type="button"
+                onClick={() => setShowOwnerPasswordBox(false)}
+                className="min-h-[40px] px-3 rounded-lg bg-zinc-800 text-xs text-zinc-300 cursor-pointer"
+              >
+                {t.pro.cancel}
+              </button>
+              <button
+                type="submit"
+                disabled={ownerPassBusy}
+                className="min-h-[40px] px-4 rounded-lg bg-red-600 hover:bg-red-500 disabled:opacity-60 text-xs font-semibold text-white cursor-pointer"
+              >
+                {t.pro.saveNewPasswordBtn}
+              </button>
+            </div>
+          </form>
+        )}
 
         {/* Local Wi-Fi PC Server PIN Session Bar */}
         {localServerActive && (
@@ -427,6 +756,9 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
                   await logoutLocalServer();
                   const status = await fetchLocalAuthStatus();
                   setLocalAuthStatus(status);
+                  if (!supabaseReady) {
+                    setLocalAccountUser(null);
+                  }
                   setLocalPinBusy(false);
                 }}
                 className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-xs font-medium text-zinc-200 self-start lg:self-auto cursor-pointer"
@@ -511,8 +843,13 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
             onToggleRestaurantStatus={onToggleRestaurantStatus}
             onDeleteRestaurant={onDeleteRestaurant}
             onCreateOwnerAccount={onCreateOwnerAccount}
+            onUpdateOwnerProfile={async (payload) => {
+              const updated = await onUpdateOwnerProfile(payload);
+              return updated;
+            }}
             onToggleUserActive={onToggleUserActive}
             onReassignOwner={onReassignOwner}
+            onResetUserPassword={onResetUserPassword}
             onManageRestaurant={(id) => {
               onSelectRestaurant(id);
               setAdminMode('venue');
@@ -520,6 +857,168 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
             onOpenQr={onOpenQr}
             onOpenCustomerMenu={onOpenCustomerMenu}
           />
+        )}
+
+        {currentUser.role === 'super_admin' && adminMode === 'account' && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <form
+              onSubmit={handleSaveSuperAdminAccount}
+              className="lg:col-span-2 rounded-2xl bg-[#141418] border border-zinc-800 p-6 sm:p-8 space-y-5"
+            >
+              <div className="flex items-start gap-3">
+                <UserCog className="w-6 h-6 text-orange-400 shrink-0 mt-0.5" aria-hidden="true" />
+                <div>
+                  <h2 className="font-display text-2xl font-bold text-white">
+                    {t.pro.myAccountTitle}
+                  </h2>
+                  <p className="text-xs sm:text-sm text-zinc-400 mt-1">{t.pro.myAccountSubtitle}</p>
+                </div>
+              </div>
+
+              <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-4 py-3 text-xs flex flex-wrap items-center justify-between gap-2">
+                <span className="text-zinc-400">{t.pro.currentEmailLabel}</span>
+                <span className="font-mono font-semibold text-white">
+                  {currentUser.email || '—'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    {t.pro.adminUsernameLabel}
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    minLength={2}
+                    maxLength={50}
+                    value={accountUsername}
+                    onChange={(e) => setAccountUsername(e.target.value)}
+                    placeholder={t.auth.setupUsernamePlaceholder}
+                    className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    {t.auth.setupFullNameLabel}
+                  </label>
+                  <input
+                    type="text"
+                    value={accountName}
+                    onChange={(e) => setAccountName(e.target.value)}
+                    className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    {t.pro.adminNewPasswordLabel}
+                  </label>
+                  <input
+                    type="password"
+                    minLength={4}
+                    autoComplete="new-password"
+                    value={accountPassword}
+                    onChange={(e) => setAccountPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    {t.pro.adminConfirmPasswordLabel}
+                  </label>
+                  <input
+                    type="password"
+                    minLength={4}
+                    autoComplete="new-password"
+                    value={accountConfirmPassword}
+                    onChange={(e) => setAccountConfirmPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full min-h-[42px] px-3 rounded-lg bg-zinc-900 border border-zinc-700 text-sm text-white"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+                {supabaseReady && currentUser.email?.includes('@') ? (
+                  <button
+                    type="button"
+                    disabled={accountResetSending}
+                    onClick={async () => {
+                      const targetEmail = (currentUser.email || '').trim();
+                      setAccountResetSending(true);
+                      try {
+                        const res = await requestSupabasePasswordReset(targetEmail);
+                        if (!res.ok) {
+                          showToast(res.error || t.toast.supabaseError, 'error');
+                        } else {
+                          showToast(t.auth.resetEmailSent);
+                        }
+                      } finally {
+                        setAccountResetSending(false);
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 min-h-[40px] px-4 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-xs font-medium text-zinc-200 cursor-pointer disabled:opacity-60"
+                  >
+                    <Mail className="w-3.5 h-3.5 text-orange-400" aria-hidden="true" />
+                    <span>{t.pro.triggerEmailResetBtn}</span>
+                  </button>
+                ) : (
+                  <span />
+                )}
+
+                <button
+                  type="submit"
+                  disabled={accountBusy}
+                  className="min-h-[42px] px-5 rounded-lg bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-500 hover:to-orange-500 disabled:opacity-60 text-xs sm:text-sm font-semibold text-white cursor-pointer"
+                >
+                  {t.pro.saveAdminCredsBtn}
+                </button>
+              </div>
+            </form>
+
+            <div className="rounded-2xl bg-[#141418] border border-zinc-800 p-6 space-y-4 h-fit">
+              <div className="flex items-center gap-2.5">
+                <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" aria-hidden="true" />
+                <h3 className="text-base font-bold text-white">{t.pro.accountInfoTitle}</h3>
+              </div>
+
+              <div className="space-y-2.5 text-xs">
+                <div className="flex justify-between gap-2 py-1.5 border-b border-zinc-800">
+                  <span className="text-zinc-400">{t.auth.setupFullNameLabel}</span>
+                  <span className="font-medium text-white text-right">{currentUser.name || '—'}</span>
+                </div>
+                <div className="flex justify-between gap-2 py-1.5 border-b border-zinc-800">
+                  <span className="text-zinc-400">{t.pro.currentUsernameLabel}</span>
+                  <span className="font-mono font-semibold text-white text-right">
+                    {currentUser.username || '—'}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2 py-1.5 border-b border-zinc-800">
+                  <span className="text-zinc-400">{t.pro.credsEmailLabel}</span>
+                  <span className="font-mono text-zinc-200 text-right">
+                    {currentUser.email || '—'}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2 py-1.5 border-b border-zinc-800">
+                  <span className="text-zinc-400">{t.pro.accountRoleLabel}</span>
+                  <span className="font-mono font-semibold text-orange-400">super_admin</span>
+                </div>
+                <div className="flex justify-between gap-2 py-1.5 border-b border-zinc-800">
+                  <span className="text-zinc-400">{t.pro.accountStatusLabel}</span>
+                  <span className="text-emerald-400 font-medium">{t.pro.statusActive}</span>
+                </div>
+                <div className="flex justify-between gap-2 py-1.5 border-b border-zinc-800">
+                  <span className="text-zinc-400">Backend</span>
+                  <span className="text-zinc-200">
+                    {supabaseReady ? 'Supabase Cloud' : 'Serveur local PC'}
+                  </span>
+                </div>
+              </div>
+
+              <p className="text-xs text-zinc-400 leading-relaxed">{t.pro.accountIsolationNotice}</p>
+            </div>
+          </div>
         )}
 
         {currentUser.role === 'super_admin' && adminMode === 'security' && (
@@ -535,7 +1034,11 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
 
             <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-2 text-xs text-zinc-300">
               <p className="font-semibold text-white">
-                {supabaseReady ? t.auth.supabaseActive : t.auth.supabaseFallback}
+                {supabaseReady
+                  ? t.auth.supabaseActive
+                  : localServerActive
+                  ? t.auth.localServerActive
+                  : t.auth.noBackendTitle}
                 {supabaseReady && projectHost ? ` · ${projectHost}` : ''}
               </p>
               <ul className="list-disc pl-5 space-y-1 text-zinc-400">

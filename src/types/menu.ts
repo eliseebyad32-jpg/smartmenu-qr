@@ -58,9 +58,9 @@ export type UserRole = 'super_admin' | 'restaurateur';
 
 export interface PlatformUser {
   id: string;
+  username: string;
   name: string;
-  email: string;
-  password: string; // Used only for local demo authentication when Supabase is not configured
+  email?: string;
   role: UserRole;
   assignedRestaurantId: string | null;
   isActive: boolean;

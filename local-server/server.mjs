@@ -145,6 +145,18 @@ function verifySessionToken(token, secret, revokedJtis) {
   }
 }
 
+function sanitizeAccount(acc) {
+  return {
+    id: acc.id,
+    username: acc.username,
+    name: acc.name,
+    ...(acc.email ? { email: acc.email } : {}),
+    role: acc.role,
+    assignedRestaurantId: acc.assignedRestaurantId ?? null,
+    isActive: Boolean(acc.isActive),
+  };
+}
+
 function scoreLanInterface(name, address) {
   const lower = name.toLowerCase();
   let score = 0;
@@ -203,7 +215,10 @@ export function createLocalServerApp(customOptions = {}) {
   function readAuthRecord() {
     const existing = readJsonSafe(authFile, null);
     if (existing && existing.tokenSecret) {
-      return existing;
+      return {
+        ...existing,
+        accounts: Array.isArray(existing.accounts) ? existing.accounts : [],
+      };
     }
     const created = {
       tokenSecret: crypto.randomBytes(32).toString('hex'),
@@ -211,6 +226,7 @@ export function createLocalServerApp(customOptions = {}) {
       pinHash: '',
       role: 'restaurateur',
       restaurantId: config.restaurantId || null,
+      accounts: [],
       updatedAt: new Date().toISOString(),
     };
     const envPin = String(process.env.LOCAL_PRO_PIN || '').trim();
@@ -295,7 +311,22 @@ export function createLocalServerApp(customOptions = {}) {
     const token = extractBearerToken(req);
     if (!token) return null;
     const authRecord = readAuthRecord();
-    return verifySessionToken(token, authRecord.tokenSecret, revokedJtis);
+    const payload = verifySessionToken(token, authRecord.tokenSecret, revokedJtis);
+    if (!payload) return null;
+
+    if (payload.sub) {
+      const account = (authRecord.accounts || []).find((a) => a.id === payload.sub);
+      if (!account || !account.isActive) return null;
+      if (account.revokedBefore && payload.iat <= account.revokedBefore) return null;
+      return {
+        ...payload,
+        role: account.role,
+        restaurantId: account.assignedRestaurantId ?? null,
+        account: sanitizeAccount(account),
+      };
+    }
+
+    return payload;
   }
 
   function requireLocalProAuth(req, res, next) {
@@ -304,6 +335,17 @@ export function createLocalServerApp(customOptions = {}) {
       return res.status(401).json({
         error: 'Authentification Pro locale requise (jeton manquant ou expiré).',
         code: 'LOCAL_AUTH_REQUIRED',
+      });
+    }
+    req.localSession = session;
+    return next();
+  }
+
+  function requireSuperAdminAuth(req, res, next) {
+    const session = resolveRequestSession(req);
+    if (!session || session.role !== 'super_admin') {
+      return res.status(session ? 403 : 401).json({
+        error: 'Action réservée exclusivement au Super Admin.',
       });
     }
     req.localSession = session;
@@ -479,6 +521,479 @@ export function createLocalServerApp(customOptions = {}) {
       cachedImagesCount: Object.keys(imageMap).length,
       updatedAt: state?.updatedAt || null,
     });
+  });
+
+  // Account-based authentication status (safe metadata only)
+  app.get('/api/auth/status', (req, res) => {
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    const hasSuperAdmin = accounts.some((a) => a.role === 'super_admin' && a.isActive);
+    const session = resolveRequestSession(req);
+    res.json({
+      ok: true,
+      hasSuperAdmin,
+      authenticated: Boolean(session?.account),
+      user: session?.account ?? null,
+    });
+  });
+
+  // First-run Super Admin setup (atomic check: only works when zero active super_admin exists)
+  app.post('/api/auth/setup-admin', (req, res) => {
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    if (accounts.some((a) => a.role === 'super_admin' && a.isActive)) {
+      return res.status(409).json({
+        error: 'Un compte Super Admin principal existe déjà.',
+      });
+    }
+
+    const { username, name, email, password } = req.body || {};
+    const normalizedUsername = String(username || '').trim().toLowerCase();
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const fullName = String(name || '').trim() || normalizedUsername;
+    const pwd = String(password || '');
+
+    if (normalizedUsername.length < 2 || normalizedUsername.length > 50) {
+      return res.status(400).json({ error: 'Identifiant invalide (2 à 50 caractères).' });
+    }
+    if (normalizedEmail && !normalizedEmail.includes('@')) {
+      return res.status(400).json({ error: 'Adresse e-mail invalide.' });
+    }
+    if (pwd.length < 4) {
+      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 4 caractères.' });
+    }
+    if (
+      accounts.some(
+        (a) =>
+          a.username.toLowerCase() === normalizedUsername ||
+          (normalizedEmail && a.email && a.email.toLowerCase() === normalizedEmail)
+      )
+    ) {
+      return res.status(409).json({ error: 'Cet identifiant ou e-mail est déjà utilisé.' });
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const nowIso = new Date().toISOString();
+    const adminAccount = {
+      id: `user-${crypto.randomUUID()}`,
+      username: normalizedUsername,
+      email: normalizedEmail,
+      name: fullName,
+      role: 'super_admin',
+      assignedRestaurantId: null,
+      salt,
+      passwordHash: hashPin(pwd, salt),
+      isActive: true,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      revokedBefore: 0,
+    };
+
+    writeAuthRecord({
+      ...authRecord,
+      accounts: [...accounts, adminAccount],
+      updatedAt: nowIso,
+    });
+
+    const now = Date.now();
+    const ttlMs = (config.sessionTtlMinutes || 480) * 60 * 1000;
+    const token = signSessionToken(
+      {
+        jti: crypto.randomUUID(),
+        sub: adminAccount.id,
+        role: 'super_admin',
+        restaurantId: null,
+        iat: now,
+        exp: now + ttlMs,
+      },
+      authRecord.tokenSecret
+    );
+
+    return res.json({
+      ok: true,
+      token,
+      user: sanitizeAccount(adminAccount),
+    });
+  });
+
+  // Username + Password login -> returns signed HMAC Bearer token
+  app.post('/api/auth/login', (req, res) => {
+    const clientKey = getClientKey(req);
+    const limit = checkRateLimit(clientKey);
+    if (limit.blocked) {
+      return res.status(429).json({
+        error: `Trop de tentatives échouées. Réessayez dans ${limit.retryAfterSeconds}s.`,
+        retryAfterSeconds: limit.retryAfterSeconds,
+      });
+    }
+
+    const { identifier, password } = req.body || {};
+    const normalized = String(identifier || '').trim().toLowerCase();
+    const pwd = String(password || '');
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+
+    const account = accounts.find(
+      (a) =>
+        a.username.toLowerCase() === normalized ||
+        (a.email && a.email.toLowerCase() === normalized)
+    );
+
+    if (!account || !account.isActive || !verifyPinHash(pwd, account.salt, account.passwordHash)) {
+      const failure = recordFailedAttempt(clientKey);
+      if (failure.lockedUntil) {
+        return res.status(429).json({
+          error: 'Trop de tentatives échouées. Connexion temporairement verrouillée.',
+          retryAfterSeconds: Math.ceil((failure.lockedUntil - Date.now()) / 1000),
+        });
+      }
+      return res.status(401).json({
+        error: 'Identifiants invalides ou compte suspendu.',
+        remainingAttempts: Math.max(0, failure.maxAttempts - failure.count),
+      });
+    }
+
+    clearFailedAttempts(clientKey);
+
+    const now = Date.now();
+    const ttlMs = (config.sessionTtlMinutes || 480) * 60 * 1000;
+    const token = signSessionToken(
+      {
+        jti: crypto.randomUUID(),
+        sub: account.id,
+        role: account.role,
+        restaurantId: account.assignedRestaurantId ?? null,
+        iat: now,
+        exp: now + ttlMs,
+      },
+      authRecord.tokenSecret
+    );
+
+    return res.json({
+      ok: true,
+      token,
+      user: sanitizeAccount(account),
+    });
+  });
+
+  app.get('/api/auth/me', (req, res) => {
+    const session = resolveRequestSession(req);
+    if (!session?.account) {
+      return res.status(401).json({ ok: false, user: null });
+    }
+    return res.json({ ok: true, user: session.account });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const session = resolveRequestSession(req);
+    if (session?.jti) {
+      revokedJtis.add(session.jti);
+    }
+    return res.json({ ok: true });
+  });
+
+  app.post('/api/auth/change-credentials', requireSuperAdminAuth, (req, res) => {
+    const session = req.localSession;
+    if (!session.sub) {
+      return res.status(403).json({ error: 'Connectez-vous avec un compte Super Admin.' });
+    }
+    const { username, email, password, name } = req.body || {};
+    const normalizedUsername = String(username || '').trim().toLowerCase();
+    const hasEmailField = typeof email === 'string';
+    const normalizedEmail = hasEmailField ? email.trim().toLowerCase() : undefined;
+    const pwd = String(password || '');
+    const fullName = String(name || '').trim();
+
+    if (normalizedUsername.length < 2 || normalizedUsername.length > 50) {
+      return res.status(400).json({ error: 'Identifiant invalide (2 à 50 caractères).' });
+    }
+    if (normalizedEmail && !normalizedEmail.includes('@')) {
+      return res.status(400).json({ error: 'Adresse e-mail invalide.' });
+    }
+    if (pwd && pwd.length < 4) {
+      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 4 caractères.' });
+    }
+
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    if (
+      accounts.some(
+        (a) =>
+          a.id !== session.sub &&
+          (a.username.toLowerCase() === normalizedUsername ||
+            (normalizedEmail && a.email && a.email.toLowerCase() === normalizedEmail))
+      )
+    ) {
+      return res.status(409).json({ error: 'Cet identifiant ou e-mail est déjà utilisé.' });
+    }
+
+    let updatedAccount = null;
+    const nextAccounts = accounts.map((acc) => {
+      if (acc.id !== session.sub) return acc;
+      const nextSalt = pwd ? crypto.randomBytes(16).toString('hex') : acc.salt;
+      updatedAccount = {
+        ...acc,
+        username: normalizedUsername,
+        email: normalizedEmail !== undefined ? normalizedEmail : acc.email || '',
+        name: fullName || acc.name,
+        salt: nextSalt,
+        passwordHash: pwd ? hashPin(pwd, nextSalt) : acc.passwordHash,
+        updatedAt: new Date().toISOString(),
+      };
+      return updatedAccount;
+    });
+
+    if (!updatedAccount) {
+      return res.status(404).json({ error: 'Compte introuvable.' });
+    }
+
+    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    return res.json({ ok: true, user: sanitizeAccount(updatedAccount) });
+  });
+
+  // Isolated self-service password change (only updates the caller's own passwordHash)
+  app.post('/api/auth/change-password', requireLocalProAuth, (req, res) => {
+    const session = req.localSession;
+    if (!session.sub) {
+      return res.status(403).json({ error: 'Connectez-vous avec un compte utilisateur.' });
+    }
+    const { currentPassword, newPassword } = req.body || {};
+    const curPwd = String(currentPassword || '');
+    const nextPwd = String(newPassword || '');
+
+    if (nextPwd.length < 4) {
+      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 4 caractères.' });
+    }
+
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    const target = accounts.find((a) => a.id === session.sub);
+    if (!target || !target.isActive) {
+      return res.status(404).json({ error: 'Compte introuvable ou suspendu.' });
+    }
+    if (!verifyPinHash(curPwd, target.salt, target.passwordHash)) {
+      return res.status(401).json({ error: 'Mot de passe actuel incorrect.' });
+    }
+
+    const nextSalt = crypto.randomBytes(16).toString('hex');
+    const nextAccounts = accounts.map((acc) =>
+      acc.id === session.sub
+        ? {
+            ...acc,
+            salt: nextSalt,
+            passwordHash: hashPin(nextPwd, nextSalt),
+            updatedAt: new Date().toISOString(),
+          }
+        : acc
+    );
+
+    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    return res.json({ ok: true });
+  });
+
+  // Super Admin Account Management Endpoints
+  app.get('/api/admin/users', requireSuperAdminAuth, (_req, res) => {
+    const authRecord = readAuthRecord();
+    return res.json({
+      ok: true,
+      users: (authRecord.accounts || []).map(sanitizeAccount),
+    });
+  });
+
+  app.post('/api/admin/users', requireSuperAdminAuth, (req, res) => {
+    const { username, name, email, password, restaurantId } = req.body || {};
+    const normalizedUsername = String(username || '').trim().toLowerCase();
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const fullName = String(name || '').trim() || normalizedUsername;
+    const pwd = String(password || '');
+    const restId = String(restaurantId || '').trim();
+
+    if (normalizedUsername.length < 2 || normalizedUsername.length > 50) {
+      return res.status(400).json({ error: 'Identifiant invalide (2 à 50 caractères).' });
+    }
+    if (normalizedEmail && !normalizedEmail.includes('@')) {
+      return res.status(400).json({ error: 'Adresse e-mail invalide.' });
+    }
+    if (pwd.length < 4) {
+      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 4 caractères.' });
+    }
+    if (!restId) {
+      return res.status(400).json({ error: 'Veuillez sélectionner un restaurant.' });
+    }
+
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    if (
+      accounts.some(
+        (a) =>
+          a.username.toLowerCase() === normalizedUsername ||
+          (normalizedEmail && a.email && a.email.toLowerCase() === normalizedEmail)
+      )
+    ) {
+      return res.status(409).json({ error: 'Cet identifiant ou e-mail existe déjà.' });
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const nowIso = new Date().toISOString();
+    const created = {
+      id: `user-${crypto.randomUUID()}`,
+      username: normalizedUsername,
+      email: normalizedEmail,
+      name: fullName,
+      role: 'restaurateur',
+      assignedRestaurantId: restId,
+      salt,
+      passwordHash: hashPin(pwd, salt),
+      isActive: true,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      revokedBefore: 0,
+    };
+
+    writeAuthRecord({
+      ...authRecord,
+      accounts: [...accounts, created],
+      updatedAt: nowIso,
+    });
+
+    return res.json({ ok: true, user: sanitizeAccount(created) });
+  });
+
+  app.patch('/api/admin/users/:id', requireSuperAdminAuth, (req, res) => {
+    const targetId = req.params.id;
+    const { username, name, email, restaurantId } = req.body || {};
+    const normalizedUsername = String(username || '').trim().toLowerCase();
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const fullName = String(name || '').trim() || normalizedUsername;
+    const restId = restaurantId ? String(restaurantId).trim() : null;
+
+    if (normalizedUsername.length < 2 || normalizedUsername.length > 50) {
+      return res.status(400).json({ error: 'Identifiant invalide (2 à 50 caractères).' });
+    }
+    if (normalizedEmail && !normalizedEmail.includes('@')) {
+      return res.status(400).json({ error: 'Adresse e-mail invalide.' });
+    }
+
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    if (
+      accounts.some(
+        (a) =>
+          a.id !== targetId &&
+          (a.username.toLowerCase() === normalizedUsername ||
+            (normalizedEmail && a.email && a.email.toLowerCase() === normalizedEmail))
+      )
+    ) {
+      return res.status(409).json({ error: 'Cet identifiant ou e-mail est déjà utilisé.' });
+    }
+
+    let updatedAccount = null;
+    const nextAccounts = accounts.map((acc) => {
+      if (acc.id !== targetId) return acc;
+      updatedAccount = {
+        ...acc,
+        username: normalizedUsername,
+        name: fullName,
+        email: normalizedEmail,
+        assignedRestaurantId: acc.role === 'restaurateur' ? restId : acc.assignedRestaurantId,
+        updatedAt: new Date().toISOString(),
+      };
+      return updatedAccount;
+    });
+
+    if (!updatedAccount) {
+      return res.status(404).json({ error: 'Compte introuvable.' });
+    }
+
+    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    return res.json({ ok: true, user: sanitizeAccount(updatedAccount) });
+  });
+
+  app.patch('/api/admin/users/:id/password', requireSuperAdminAuth, (req, res) => {
+    const targetId = req.params.id;
+    const pwd = String(req.body?.newPassword || '');
+    if (pwd.length < 4) {
+      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 4 caractères.' });
+    }
+
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    let found = false;
+    const nowMs = Date.now();
+    const nextAccounts = accounts.map((acc) => {
+      if (acc.id !== targetId) return acc;
+      found = true;
+      const salt = crypto.randomBytes(16).toString('hex');
+      return {
+        ...acc,
+        salt,
+        passwordHash: hashPin(pwd, salt),
+        revokedBefore: nowMs,
+        updatedAt: new Date(nowMs).toISOString(),
+      };
+    });
+
+    if (!found) {
+      return res.status(404).json({ error: 'Compte introuvable.' });
+    }
+
+    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    return res.json({ ok: true });
+  });
+
+  app.patch('/api/admin/users/:id/status', requireSuperAdminAuth, (req, res) => {
+    const targetId = req.params.id;
+    const isActive = Boolean(req.body?.isActive);
+    if (targetId === req.localSession.sub && !isActive) {
+      return res.status(400).json({ error: 'Impossible de suspendre votre propre compte actif.' });
+    }
+
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    let found = false;
+    const nowMs = Date.now();
+    const nextAccounts = accounts.map((acc) => {
+      if (acc.id !== targetId) return acc;
+      found = true;
+      return {
+        ...acc,
+        isActive,
+        revokedBefore: isActive ? acc.revokedBefore || 0 : nowMs,
+        updatedAt: new Date(nowMs).toISOString(),
+      };
+    });
+
+    if (!found) {
+      return res.status(404).json({ error: 'Compte introuvable.' });
+    }
+
+    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    return res.json({ ok: true });
+  });
+
+  app.patch('/api/admin/users/:id/restaurant', requireSuperAdminAuth, (req, res) => {
+    const targetId = req.params.id;
+    const nextRestId = req.body?.restaurantId ? String(req.body.restaurantId).trim() : null;
+
+    const authRecord = readAuthRecord();
+    const accounts = authRecord.accounts || [];
+    let found = false;
+    const nextAccounts = accounts.map((acc) => {
+      if (acc.id !== targetId || acc.role !== 'restaurateur') return acc;
+      found = true;
+      return {
+        ...acc,
+        assignedRestaurantId: nextRestId,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+
+    if (!found) {
+      return res.status(404).json({ error: 'Compte restaurateur introuvable.' });
+    }
+
+    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    return res.json({ ok: true });
   });
 
   // Local authentication status check (safe metadata only)

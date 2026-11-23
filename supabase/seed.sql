@@ -4,9 +4,8 @@
 -- et configure le compte Super Admin pour : eliseebyad32@gmail.com
 
 -- ============================================================================
--- 1. ACTIVATION DU COMPTE SUPER ADMIN (eliseebyad32@gmail.com)
--- Prérequis : créez d'abord l'utilisateur eliseebyad32@gmail.com dans
--- Supabase → Authentication → Users (ou inscrivez-vous avec cet e-mail).
+-- 1. ACTIVATION DU COMPTE SUPER ADMIN (Fandé@gmail.com / eliseebyad32@gmail.com)
+-- Prérequis : créez d'abord votre utilisateur dans Supabase → Authentication → Users.
 -- ============================================================================
 insert into public.profiles (id, full_name, email, role, restaurant_id, is_active)
 select
@@ -17,12 +16,12 @@ select
   null,
   true
 from auth.users u
-where lower(u.email) = lower('eliseebyad32@gmail.com')
+where lower(u.email) in (lower('Fandé@gmail.com'), lower('fande@gmail.com'), lower('eliseebyad32@gmail.com'))
 on conflict (id) do update
   set role = 'super_admin',
       restaurant_id = null,
       is_active = true,
-      email = excluded.email;
+      email = coalesce(nullif(trim(public.profiles.email), ''), excluded.email);
 
 -- ============================================================================
 -- 2. CATÉGORIES DE BASE POUR LES 4 PLATS DE DÉMONSTRATION

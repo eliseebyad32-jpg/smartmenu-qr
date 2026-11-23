@@ -89,26 +89,27 @@ const SEED_RESTAURANT_HERO_BY_ID = new Map(
 
 const SEED_USER_IDS = new Set(['user-super-admin', 'user-roco-owner', 'user-kin-owner']);
 
-function hasLegacySeedSecrets(rawUsers: Partial<PlatformUser>[] | undefined): boolean {
+function hasLegacySeedSecrets(rawUsers: Array<Partial<PlatformUser> & { password?: string }> | undefined): boolean {
   if (!Array.isArray(rawUsers)) return false;
   return rawUsers.some(
     (u) =>
-      u.id &&
-      SEED_USER_IDS.has(u.id) &&
-      (Boolean(u.password) || (typeof u.email === 'string' && u.email.includes('@')))
+      (u.id && SEED_USER_IDS.has(u.id)) ||
+      typeof u.password === 'string'
   );
 }
 
-function scrubSeedUsers(rawUsers: PlatformUser[]): PlatformUser[] {
-  return rawUsers.map((u) => {
-    if (!SEED_USER_IDS.has(u.id)) return u;
-    const seedMatch = INITIAL_USERS.find((s) => s.id === u.id);
-    return {
-      ...u,
-      email: seedMatch ? seedMatch.email : 'demo-local',
-      password: '',
-    };
-  });
+function scrubSeedUsers(rawUsers: Array<Partial<PlatformUser> & { password?: string }>): PlatformUser[] {
+  return rawUsers
+    .filter((u) => !u.id || !SEED_USER_IDS.has(u.id))
+    .map((u) => ({
+      id: String(u.id || ''),
+      username: String(u.username || u.email || ''),
+      name: String(u.name || u.username || u.email || ''),
+      ...(u.email ? { email: String(u.email) } : {}),
+      role: u.role === 'super_admin' ? 'super_admin' : 'restaurateur',
+      assignedRestaurantId: u.assignedRestaurantId ?? null,
+      isActive: Boolean(u.isActive ?? true),
+    }));
 }
 
 function normalizeState(
@@ -121,7 +122,7 @@ function normalizeState(
   const now = new Date().toISOString();
   const normalizedUsers =
     Array.isArray(raw.users) && raw.users.length > 0
-      ? scrubSeedUsers(raw.users)
+      ? scrubSeedUsers(raw.users as Array<Partial<PlatformUser> & { password?: string }>)
       : allowSeedUsers
       ? INITIAL_USERS
       : [];

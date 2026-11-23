@@ -213,35 +213,7 @@ export const INITIAL_RESTAURANTS: Restaurant[] = [
   },
 ];
 
-export const INITIAL_USERS: PlatformUser[] = [
-  {
-    id: 'user-super-admin',
-    name: 'Admin Principal SMARTMENU',
-    email: 'admin-local',
-    password: '',
-    role: 'super_admin',
-    assignedRestaurantId: null,
-    isActive: true,
-  },
-  {
-    id: 'user-roco-owner',
-    name: 'Espace Démonstration — RocoMamas Lubumbashi',
-    email: 'demo-lubumbashi',
-    password: '',
-    role: 'restaurateur',
-    assignedRestaurantId: 'rocomamas-lubumbashi',
-    isActive: true,
-  },
-  {
-    id: 'user-kin-owner',
-    name: 'Espace Démonstration — Kinshasa Urban Smoke',
-    email: 'demo-kinshasa',
-    password: '',
-    role: 'restaurateur',
-    assignedRestaurantId: 'kinshasa-urban-smoke',
-    isActive: true,
-  },
-];
+export const INITIAL_USERS: PlatformUser[] = [];
 
 export const INITIAL_MENU_ITEMS: MenuItem[] = [
   // 1. SMASH BURGERS (4 items)

@@ -1667,6 +1667,7 @@ function startCliServer() {
     console.log('  Appuyez sur Ctrl+C ou lancez stop-windows.bat pour arreter.\n');
 
     if (config.autoSyncMinutes > 0 && config.supabaseUrl && config.supabaseAnonKey) {
+      void pullCloudCatalogToLocal({ timeoutMs: 6000, quiet: true });
       const intervalMs = Math.max(1, config.autoSyncMinutes) * 60 * 1000;
       syncTimer = setInterval(() => {
         void pullCloudCatalogToLocal({ timeoutMs: 6000, quiet: true });

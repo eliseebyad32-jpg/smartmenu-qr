@@ -10,7 +10,8 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "local:server": "node local-server/server.mjs",
-    "local:sync": "node local-server/sync-cloud.mjs"
+    "local:sync": "node local-server/sync-cloud.mjs",
+    "build:windows-installer": "node windows-installer/build-windows-installer.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

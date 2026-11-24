@@ -1,56 +1,44 @@
-# SMARTMENU QR — Guide très simple d'installation sur PC Windows
+# SMARTMENU QR — Guide d'installation simple sur Windows 10 / 11
 
-> **Important :** Le serveur n'est **pas** encore installé sur votre ordinateur Windows. Vous n'avez **aucune commande** à taper dans PowerShell ou CMD : tout se fait par double-clic et via une fenêtre graphique simple.
-
----
-
-## Avant de commencer
-
-1. Copiez le dossier complet **SMARTMENU QR** sur le PC Windows du restaurant (par exemple sur `C:\SMARTMENU-QR` ou dans `Documents\SMARTMENU-QR`).
-2. Assurez-vous que le PC est connecté à Internet **uniquement la première fois** pour télécharger les composants et récupérer votre menu Supabase (ensuite, le restaurant pourra fonctionner même sans Internet).
+> **Objectif :** Installer SmartMenu QR comme un logiciel Windows classique, sans ouvrir de terminal et sans aucune manipulation technique.
 
 ---
 
-## Étape 1 — Lancer l'installateur graphique (1 double-clic)
+## 1. Installation en quelques clics (`SmartMenu-QR-Setup.exe`)
 
-1. Ouvrez le dossier **SMARTMENU QR**.
-2. Double-cliquez sur le fichier **`INSTALLER-SMARTMENU-WINDOWS.bat`**.
-3. Une fenêtre s'ouvre automatiquement : **« SMARTMENU QR — Serveur Local & Synchronisation »**.
+1. Récupérez le fichier **`SmartMenu-QR-Setup.exe`** (situé dans `windows-installer/output/SmartMenu-QR-Setup.exe`).
+2. **Double-cliquez sur `SmartMenu-QR-Setup.exe`** et acceptez la demande Windows *(Autoriser cette application à apporter des modifications)*.
+3. Suivez l'assistant :
+   - L'assistant **détecte automatiquement votre réseau Wi-Fi et l'adresse IP du PC** (exemple : `http://192.168.1.50:3000`).
+   - Vérifiez le mode souhaité : **un seul restaurant** (ex. `rocomamas-lubumbashi`) ou **multi-restaurants**.
+   - Les paramètres nécessaires (Node.js intégré, application compilée, Pare-feu Windows, accès Supabase) sont configurés **automatiquement**.
+   - Cochez si vous le souhaitez **« Lancer automatiquement SmartMenu QR après le démarrage de Windows »**.
+4. Cliquez sur **Installer**, puis sur **Terminer** (en laissant coché *Démarrer SmartMenu QR maintenant*).
 
----
-
-## Étape 2 — Vérifier les options dans la fenêtre
-
-Dans l'assistant graphique :
-
-1. **Node.js** (en haut de la fenêtre) :
-   - S'il est affiché en vert (**« Node.js détecté (prêt) »**), passez directement à la suite.
-   - Sinon, cliquez simplement sur le bouton orange **« Installer Node.js LTS »**, attendez la fin de l'installation automatique, puis passez à la suite.
-2. **Restaurant & isolation** :
-   - Laissez coché **« Isoler ce PC uniquement sur un restaurant »** et indiquez le **slug** du restaurant (ex. `rocomamas-lubumbashi`).
-   - *Décocher* cette case permet au contraire de conserver le mode **multi-restaurants** complet sur ce PC.
-3. **Supabase** :
-   - Vérifiez ou collez votre **URL Supabase** et votre **clé publique (`anon key`)**. Si un fichier `.env` existe déjà, vos paramètres sont pré-remplis et conservés.
-4. **Cases cochées par défaut** (laissez-les cochées) :
-   - Configurer l'accès Wi-Fi des téléphones (Pare-feu Windows) — acceptez la fenêtre Windows si elle demande votre confirmation.
-   - Créer le raccourci Bureau **« Démarrer SMARTMENU QR »**.
-   - Créer le raccourci Bureau **« Arrêter SMARTMENU QR »**.
-   - Pré-télécharger le menu et les images depuis Supabase.
-5. Cliquez sur le bouton rouge **« Installer automatiquement »** et attendez que la barre atteigne **100 %**.
+Un raccourci **SmartMenu QR** est automatiquement créé sur votre **Bureau Windows** et dans le **Menu Démarrer**.
 
 ---
 
-## Étape 3 — Démarrer le serveur et connecter les téléphones sur le Wi-Fi
+## 2. Utilisation au quotidien (1 clic)
 
-1. Cliquez sur le bouton vert **« Démarrer le serveur »** dans l'installateur (ou double-cliquez plus tard sur le raccourci **`Démarrer SMARTMENU QR`** sur votre Bureau).
-2. L'adresse Wi-Fi locale s'affiche, par exemple : `http://192.168.1.50:3000`.
-3. Connectez les téléphones des clients au **même réseau Wi-Fi** que ce PC (même si Internet est coupé).
-4. Dans l'**Espace Pro → QR Code**, activez l'option **« Utiliser l’adresse Wi-Fi locale (sans Internet) »** et imprimez vos QR Codes de table.
+Double-cliquez sur l'icône **SmartMenu QR** sur le Bureau :
+
+- **Démarrer / Arrêter le serveur** : un seul bouton dans la fenêtre (ou clic droit sur l'icône près de l'horloge Windows).
+- **Ouvrir dans le navigateur** : ouvre directement le menu sur ce PC (`http://localhost:3000`).
+- **Copier l'adresse Wi-Fi** : copie l'adresse exacte pour les téléphones des clients (`http://192.168.x.x:3000/?restaurant=...`).
+- **Synchroniser depuis Supabase** : télécharge les dernières nouveautés du cloud sur le PC en 1 clic (automatique aussi toutes les 5 minutes dès qu'Internet est disponible).
+- **Lancer automatiquement après le démarrage de Windows** : cochez ou décochez cette option à tout moment dans la fenêtre.
+- **Fermer la fenêtre (`X`)** : réduit SmartMenu QR près de l'horloge sans couper le Wi-Fi des clients. Pour couper le serveur complètement, cliquez sur **Arrêter et Quitter**.
 
 ---
 
-## Utilisation au quotidien (sur le Bureau Windows)
+## 3. Mise à jour simple (sans perte de données)
 
-- **Allumer le serveur :** double-cliquez sur **`Démarrer SMARTMENU QR`** sur votre Bureau.
-- **Éteindre le serveur :** double-cliquez sur **`Arrêter SMARTMENU QR`** sur votre Bureau.
-- **Synchronisation avec Supabase :** dès qu'Internet est disponible, les modifications faites hors ligne (plats, prix, images) sont envoyées automatiquement vers Supabase et les nouveautés du cloud sont téléchargées automatiquement sur le PC toutes les 5 minutes.
+Toutes vos données locales (menus, plats, prix, photos ajoutées hors ligne, comptes et configuration) sont enregistrées séparément dans `C:\ProgramData\SmartMenuQR`.
+
+Pour mettre à jour SmartMenu QR :
+
+- **Pour mettre à jour les menus et photos** : cliquez simplement sur **Synchroniser depuis Supabase** (ou attendez la synchronisation automatique).
+- **Pour installer une nouvelle version du logiciel** :
+  1. Double-cliquez directement sur le nouveau **`SmartMenu-QR-Setup.exe`** (ou cliquez sur **Mettre à jour (.exe)...** dans SmartMenu QR).
+  2. L'assistant arrête le serveur, met à jour le logiciel et **conserve 100 % de vos données et réglages locaux automatiquement**.

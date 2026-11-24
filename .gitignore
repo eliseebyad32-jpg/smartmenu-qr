@@ -9,4 +9,7 @@ coverage/
 local-server/config.json
 local-server/data/
 exports/
+windows-installer/.cache/
+windows-installer/.staging/
+windows-installer/src/*.res
 

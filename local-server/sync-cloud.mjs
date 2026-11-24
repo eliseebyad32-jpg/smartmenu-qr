@@ -20,17 +20,32 @@ export function isMainModule(metaUrl) {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const ROOT_DIR = path.resolve(__dirname, '..');
-export const DATA_DIR = path.join(__dirname, 'data');
+export const DATA_DIR = process.env.SMARTMENU_DATA_DIR
+  ? path.resolve(process.env.SMARTMENU_DATA_DIR)
+  : path.join(__dirname, 'data');
 export const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 export const IMAGE_CACHE_DIR = path.join(DATA_DIR, 'image-cache');
 export const IMAGE_MAP_FILE = path.join(DATA_DIR, 'image-map.json');
 export const DATA_FILE = path.join(DATA_DIR, 'catalog.json');
 export const AUTH_FILE = path.join(DATA_DIR, 'local-auth.json');
 export const PID_FILE = path.join(DATA_DIR, 'server.pid');
-export const CONFIG_FILE = path.join(__dirname, 'config.json');
+export const CONFIG_FILE = process.env.SMARTMENU_CONFIG_FILE
+  ? path.resolve(process.env.SMARTMENU_CONFIG_FILE)
+  : path.join(__dirname, 'config.json');
 
-// Load .env from project root without overriding explicit shell env vars
-dotenv.config({ path: path.join(ROOT_DIR, '.env') });
+// Load external Windows installer .env first (if configured), then project .env.local and .env
+const externalEnvFile = process.env.SMARTMENU_ENV_FILE
+  ? path.resolve(process.env.SMARTMENU_ENV_FILE)
+  : null;
+for (const envCandidate of [
+  externalEnvFile,
+  path.join(ROOT_DIR, '.env.local'),
+  path.join(ROOT_DIR, '.env'),
+]) {
+  if (envCandidate && fs.existsSync(envCandidate)) {
+    dotenv.config({ path: envCandidate, override: false });
+  }
+}
 
 export function ensureDataDirectories() {
   for (const dir of [DATA_DIR, UPLOADS_DIR, IMAGE_CACHE_DIR]) {
@@ -64,11 +79,11 @@ export function loadLocalConfig() {
     publicLanUrl: String(process.env.PUBLIC_LAN_URL ?? fileConfig.publicLanUrl ?? '')
       .trim()
       .replace(/\/+$/, ''),
-    supabaseUrl: String(process.env.VITE_SUPABASE_URL ?? fileConfig.supabaseUrl ?? '')
+    supabaseUrl: String(process.env.VITE_SUPABASE_URL || fileConfig.supabaseUrl || '')
       .trim()
       .replace(/\/+$/, ''),
     supabaseAnonKey: String(
-      process.env.VITE_SUPABASE_ANON_KEY ?? fileConfig.supabaseAnonKey ?? ''
+      process.env.VITE_SUPABASE_ANON_KEY || fileConfig.supabaseAnonKey || ''
     ).trim(),
     autoSyncMinutes: Number(process.env.AUTO_SYNC_MINUTES ?? fileConfig.autoSyncMinutes ?? 5),
     sessionTtlMinutes: Math.max(

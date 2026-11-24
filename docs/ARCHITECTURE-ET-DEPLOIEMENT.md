@@ -47,5 +47,5 @@ Pour activer la base PostgreSQL, l'authentification renouvelable et le stockage 
 
 - **Authentification & Base de données** : Sans `VITE_SUPABASE_URL` ni `VITE_SUPABASE_ANON_KEY`, l'authentification et les modifications utilisent le serveur local PC Windows (`local-server/data/`) ou le stockage local du navigateur.
 - **Commandes en salle** : Le panier permet au client de composer sa sélection et de copier/présenter le récapitulatif, sans transmission automatique en cuisine tant qu'un endpoint POS temps réel n'est pas branché.
-- **Serveur Windows** : Déployé sur le PC du restaurant via `INSTALLER-SMARTMENU-WINDOWS.bat` et `docs/WINDOWS-LOCAL-SERVER.md`.
+- **Serveur Windows** : Installé sur le PC du restaurant via le véritable installateur **`windows-installer/output/SmartMenu-QR-Setup.exe`** et piloté en 1 clic par **`SmartMenuQR.exe`** (`docs/GUIDE-INSTALLATION-WINDOWS.md` et `docs/WINDOWS-LOCAL-SERVER.md`).
 

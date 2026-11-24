@@ -162,6 +162,18 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({ restaurant, onClose })
             <img
               src={restaurant.logoUrl}
               alt={restaurant.name}
+              onError={(e) => {
+                const img = e.currentTarget;
+                if (
+                  restaurant.logoUrl?.startsWith('http') &&
+                  !img.dataset.mirrorTried
+                ) {
+                  img.dataset.mirrorTried = '1';
+                  img.src = `/api/cached-image?url=${encodeURIComponent(restaurant.logoUrl)}`;
+                  return;
+                }
+                img.style.display = 'none';
+              }}
               className="w-12 h-12 rounded-lg object-cover mx-auto mb-2 border border-zinc-200"
             />
           )}

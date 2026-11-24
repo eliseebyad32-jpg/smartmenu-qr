@@ -2,7 +2,6 @@ import {
   INITIAL_CATEGORIES,
   INITIAL_MENU_ITEMS,
   INITIAL_RESTAURANTS,
-  INITIAL_USERS,
 } from '../data/seedData';
 import { Category, MenuItem, PlatformUser, Restaurant } from '../types/menu';
 
@@ -16,7 +15,13 @@ const LS_OUTBOX_KEY = 'smartmenu_qr_outbox_v1';
 const LS_LAST_SYNC_KEY = 'smartmenu_qr_last_synced_at_v1';
 
 export type SyncEntityType = 'restaurant' | 'category' | 'menu_item';
-export type SyncOperation = 'upsert' | 'delete' | 'toggle_availability';
+export type SyncOperation = 'upsert' | 'delete' | 'toggle_availability' | 'toggle_status';
+
+export interface MutationAuthor {
+  userId: string;
+  role: 'super_admin' | 'restaurateur';
+  restaurantId: string | null;
+}
 
 export interface PlatformState {
   restaurants: Restaurant[];
@@ -37,13 +42,20 @@ export interface PendingSyncMutation {
   payload?: unknown;
   createdAt: string;
   baseUpdatedAt: string;
+  authorUserId?: string;
+  authorRole?: 'super_admin' | 'restaurateur';
+  authorRestaurantId?: string | null;
+  retryCount?: number;
+  lastAttemptAt?: string;
+  nextRetryAt?: string;
+  lastError?: string;
 }
 
 const DEFAULT_STATE: PlatformState = {
   restaurants: INITIAL_RESTAURANTS,
   categories: INITIAL_CATEGORIES,
   menuItems: INITIAL_MENU_ITEMS,
-  users: INITIAL_USERS,
+  users: [],
   updatedAt: new Date().toISOString(),
   baseUpdatedAt: new Date().toISOString(),
 };
@@ -87,45 +99,17 @@ const SEED_RESTAURANT_HERO_BY_ID = new Map(
   INITIAL_RESTAURANTS.map((rest) => [rest.id, rest.heroImage])
 );
 
-const SEED_USER_IDS = new Set(['user-super-admin', 'user-roco-owner', 'user-kin-owner']);
-
-function hasLegacySeedSecrets(rawUsers: Array<Partial<PlatformUser> & { password?: string }> | undefined): boolean {
-  if (!Array.isArray(rawUsers)) return false;
-  return rawUsers.some(
-    (u) =>
-      (u.id && SEED_USER_IDS.has(u.id)) ||
-      typeof u.password === 'string'
-  );
-}
-
-function scrubSeedUsers(rawUsers: Array<Partial<PlatformUser> & { password?: string }>): PlatformUser[] {
-  return rawUsers
-    .filter((u) => !u.id || !SEED_USER_IDS.has(u.id))
-    .map((u) => ({
-      id: String(u.id || ''),
-      username: String(u.username || u.email || ''),
-      name: String(u.name || u.username || u.email || ''),
-      ...(u.email ? { email: String(u.email) } : {}),
-      role: u.role === 'super_admin' ? 'super_admin' : 'restaurateur',
-      assignedRestaurantId: u.assignedRestaurantId ?? null,
-      isActive: Boolean(u.isActive ?? true),
-    }));
+function hasLegacyCachedUsers(rawUsers: unknown): boolean {
+  return Array.isArray(rawUsers) && rawUsers.length > 0;
 }
 
 function normalizeState(
-  raw: Partial<PlatformState> | undefined,
-  allowSeedUsers = true
+  raw: Partial<PlatformState> | undefined
 ): PlatformState | null {
   if (!raw || !Array.isArray(raw.restaurants) || !Array.isArray(raw.menuItems)) {
     return null;
   }
   const now = new Date().toISOString();
-  const normalizedUsers =
-    Array.isArray(raw.users) && raw.users.length > 0
-      ? scrubSeedUsers(raw.users as Array<Partial<PlatformUser> & { password?: string }>)
-      : allowSeedUsers
-      ? INITIAL_USERS
-      : [];
 
   return {
     restaurants: raw.restaurants.map((r) => {
@@ -150,7 +134,8 @@ function normalizeState(
       }
       return item;
     }),
-    users: normalizedUsers,
+    // Never store or read user profiles from public browser caches
+    users: [],
     updatedAt: raw.updatedAt || now,
     baseUpdatedAt: raw.baseUpdatedAt || raw.updatedAt || now,
   };
@@ -174,14 +159,14 @@ export function setLastSyncedAt(iso: string): void {
   }
 }
 
-export function loadCachedSnapshotSync(allowSeedUsers = false): PlatformState | null {
+export function loadCachedSnapshotSync(_allowSeedUsers = false): PlatformState | null {
   if (typeof window === 'undefined') return null;
   try {
     const raw = window.localStorage.getItem(LS_FALLBACK_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<PlatformState>;
-    const normalized = normalizeState(parsed, allowSeedUsers);
-    if (normalized && hasLegacySeedSecrets(parsed.users)) {
+    const normalized = normalizeState(parsed);
+    if (normalized && hasLegacyCachedUsers(parsed.users)) {
       window.localStorage.setItem(LS_FALLBACK_KEY, JSON.stringify(normalized));
     }
     return normalized;
@@ -201,18 +186,18 @@ export async function loadPlatformState(allowSeedFallback = true): Promise<Platf
       req.onerror = () => reject(req.error);
     });
     db.close();
-    const normalized = normalizeState(record, allowSeedFallback);
+    const normalized = normalizeState(record);
     if (normalized) {
-      if (hasLegacySeedSecrets(record?.users)) {
+      if (hasLegacyCachedUsers(record?.users)) {
         await savePlatformState(normalized);
       } else {
-        // Also ensure legacy localStorage fallback doesn't retain old seed secrets
+        // Ensure public localStorage fallback never retains user profiles
         try {
           const lsRaw = window.localStorage.getItem(LS_FALLBACK_KEY);
           if (lsRaw) {
             const lsParsed = JSON.parse(lsRaw) as Partial<PlatformState>;
-            if (hasLegacySeedSecrets(lsParsed.users)) {
-              const lsNormalized = normalizeState(lsParsed, allowSeedFallback);
+            if (hasLegacyCachedUsers(lsParsed.users)) {
+              const lsNormalized = normalizeState(lsParsed);
               if (lsNormalized) {
                 window.localStorage.setItem(LS_FALLBACK_KEY, JSON.stringify(lsNormalized));
               }
@@ -232,9 +217,9 @@ export async function loadPlatformState(allowSeedFallback = true): Promise<Platf
     const raw = window.localStorage.getItem(LS_FALLBACK_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<PlatformState>;
-      const normalized = normalizeState(parsed, allowSeedFallback);
+      const normalized = normalizeState(parsed);
       if (normalized) {
-        if (hasLegacySeedSecrets(parsed.users)) {
+        if (hasLegacyCachedUsers(parsed.users)) {
           await savePlatformState(normalized);
         }
         return normalized;
@@ -261,7 +246,11 @@ export async function loadPlatformState(allowSeedFallback = true): Promise<Platf
 
 export async function savePlatformState(state: PlatformState): Promise<PlatformState> {
   const payload: PlatformState = {
-    ...state,
+    restaurants: state.restaurants,
+    categories: state.categories,
+    menuItems: state.menuItems,
+    // Never write user profiles to localStorage or IndexedDB public catalog cache
+    users: [],
     updatedAt: state.updatedAt || new Date().toISOString(),
     baseUpdatedAt: state.baseUpdatedAt || state.updatedAt || new Date().toISOString(),
   };
@@ -336,6 +325,33 @@ export async function loadOutbox(): Promise<PendingSyncMutation[]> {
   }
 }
 
+export function computeRetryDelayMs(retryCount: number): number {
+  const cappedExponent = Math.min(Math.max(0, retryCount - 1), 4);
+  const baseMs = 5_000 * Math.pow(3, cappedExponent); // 5s, 15s, 45s, 135s, 405s
+  return Math.min(300_000, baseMs);
+}
+
+function getReplayPhaseOrder(mut: PendingSyncMutation): number {
+  if (mut.operation === 'delete') {
+    if (mut.entityType === 'menu_item') return 40;
+    if (mut.entityType === 'category') return 50;
+    if (mut.entityType === 'restaurant') return 60;
+    return 70;
+  }
+  if (mut.entityType === 'restaurant') return 10;
+  if (mut.entityType === 'category') return 20;
+  if (mut.entityType === 'menu_item') return 30;
+  return 35;
+}
+
+export function sortOutboxForReplay(mutations: PendingSyncMutation[]): PendingSyncMutation[] {
+  return [...mutations].sort((a, b) => {
+    const phaseDiff = getReplayPhaseOrder(a) - getReplayPhaseOrder(b);
+    if (phaseDiff !== 0) return phaseDiff;
+    return a.createdAt.localeCompare(b.createdAt);
+  });
+}
+
 export async function enqueueOutboxMutation(
   action: string,
   baseUpdatedAt: string,
@@ -345,13 +361,24 @@ export async function enqueueOutboxMutation(
     operation: SyncOperation;
     isNew?: boolean;
     payload?: unknown;
-  }
+  },
+  author?: MutationAuthor | null
 ): Promise<PendingSyncMutation[]> {
   const current = await loadOutbox();
+  const authorMeta = author
+    ? {
+        authorUserId: author.userId,
+        authorRole: author.role,
+        authorRestaurantId: author.restaurantId ?? null,
+      }
+    : {};
 
   if (details) {
     const existingIdx = current.findIndex(
-      (m) => m.entityType === details.entityType && m.entityId === details.entityId
+      (m) =>
+        m.entityType === details.entityType &&
+        m.entityId === details.entityId &&
+        (!m.authorUserId || !author?.userId || m.authorUserId === author.userId)
     );
     const existing = existingIdx >= 0 ? current[existingIdx] : undefined;
 
@@ -362,25 +389,39 @@ export async function enqueueOutboxMutation(
       return pruned;
     }
 
+    const preserveUpsertOverToggle =
+      existing?.operation === 'upsert' &&
+      (details.operation === 'toggle_availability' || details.operation === 'toggle_status') &&
+      Boolean(existing.payload);
+
+    const mergedOperation: SyncOperation = preserveUpsertOverToggle
+      ? 'upsert'
+      : details.operation;
+
+    const mergedPayload =
+      preserveUpsertOverToggle && existing?.payload && details.payload
+        ? {
+            ...(existing.payload as Record<string, unknown>),
+            ...(details.payload as Record<string, unknown>),
+          }
+        : details.payload;
+
+    const authorSuffix = author?.userId ? `-${author.userId}` : '';
     const merged: PendingSyncMutation = {
-      id: existing?.id ?? `mut-${details.entityType}-${details.entityId}`,
+      id: existing?.id ?? `mut-${details.entityType}-${details.entityId}${authorSuffix}`,
       action,
       entityType: details.entityType,
       entityId: details.entityId,
-      operation:
-        existing?.isNew && details.operation === 'toggle_availability'
-          ? 'upsert'
-          : details.operation,
+      operation: mergedOperation,
       isNew: Boolean(existing?.isNew || details.isNew),
-      payload:
-        existing?.isNew && details.operation === 'toggle_availability' && existing.payload
-          ? {
-              ...(existing.payload as Record<string, unknown>),
-              ...(details.payload as Record<string, unknown>),
-            }
-          : details.payload,
+      payload: mergedPayload,
       createdAt: new Date().toISOString(),
       baseUpdatedAt: existing?.baseUpdatedAt || baseUpdatedAt,
+      ...authorMeta,
+      retryCount: 0,
+      lastAttemptAt: undefined,
+      nextRetryAt: undefined,
+      lastError: undefined,
     };
 
     const next =
@@ -396,8 +437,34 @@ export async function enqueueOutboxMutation(
     action,
     createdAt: new Date().toISOString(),
     baseUpdatedAt,
+    ...authorMeta,
+    retryCount: 0,
   };
   const next = [...current, mutation];
+  await persistOutboxList(next);
+  return next;
+}
+
+export async function recordOutboxMutationFailure(
+  mutationId: string,
+  errorMessage: string,
+  retryable = true
+): Promise<PendingSyncMutation[]> {
+  const current = await loadOutbox();
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const next = current.map((entry) => {
+    if (entry.id !== mutationId) return entry;
+    const nextCount = (entry.retryCount ?? 0) + 1;
+    const delayMs = computeRetryDelayMs(nextCount);
+    return {
+      ...entry,
+      retryCount: nextCount,
+      lastAttemptAt: nowIso,
+      nextRetryAt: retryable ? new Date(nowMs + delayMs).toISOString() : undefined,
+      lastError: errorMessage,
+    };
+  });
   await persistOutboxList(next);
   return next;
 }
@@ -434,7 +501,7 @@ export async function resetPlatformState(): Promise<PlatformState> {
     restaurants: INITIAL_RESTAURANTS,
     categories: INITIAL_CATEGORIES,
     menuItems: INITIAL_MENU_ITEMS,
-    users: INITIAL_USERS,
+    users: [],
     updatedAt: now,
     baseUpdatedAt: now,
   };

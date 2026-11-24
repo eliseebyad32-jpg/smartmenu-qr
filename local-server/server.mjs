@@ -145,6 +145,10 @@ function verifySessionToken(token, secret, revokedJtis) {
   }
 }
 
+function hashRefreshToken(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
 function sanitizeAccount(acc) {
   return {
     id: acc.id,
@@ -218,6 +222,7 @@ export function createLocalServerApp(customOptions = {}) {
       return {
         ...existing,
         accounts: Array.isArray(existing.accounts) ? existing.accounts : [],
+        refreshTokens: Array.isArray(existing.refreshTokens) ? existing.refreshTokens : [],
       };
     }
     const created = {
@@ -227,6 +232,7 @@ export function createLocalServerApp(customOptions = {}) {
       role: 'restaurateur',
       restaurantId: config.restaurantId || null,
       accounts: [],
+      refreshTokens: [],
       updatedAt: new Date().toISOString(),
     };
     const envPin = String(process.env.LOCAL_PRO_PIN || '').trim();
@@ -240,8 +246,59 @@ export function createLocalServerApp(customOptions = {}) {
   }
 
   function writeAuthRecord(next) {
-    atomicWriteFile(authFile, JSON.stringify(next, null, 2));
-    return next;
+    const now = Date.now();
+    const pruneCutoff = now - 14 * 24 * 60 * 60 * 1000;
+    const prunedRefresh = (Array.isArray(next.refreshTokens) ? next.refreshTokens : []).filter(
+      (entry) =>
+        entry &&
+        entry.tokenHash &&
+        typeof entry.expiresAt === 'number' &&
+        entry.expiresAt > pruneCutoff
+    );
+    const cleanNext = {
+      ...next,
+      refreshTokens: prunedRefresh,
+    };
+    atomicWriteFile(authFile, JSON.stringify(cleanNext, null, 2));
+    return cleanNext;
+  }
+
+  function createRefreshTokenEntry(existingTokens, meta) {
+    const now = Date.now();
+    const refreshTtlMs = (config.refreshTtlDays || 7) * 24 * 60 * 60 * 1000;
+    const rawToken = base64UrlEncode(crypto.randomBytes(32));
+    const refreshExpiresAt = now + refreshTtlMs;
+    const entry = {
+      id: crypto.randomUUID(),
+      familyId: meta.familyId || crypto.randomUUID(),
+      tokenHash: hashRefreshToken(rawToken),
+      sub: meta.sub ?? null,
+      role: meta.role,
+      restaurantId: meta.restaurantId ?? null,
+      createdAt: now,
+      expiresAt: refreshExpiresAt,
+      usedAt: null,
+      revokedAt: null,
+    };
+    return {
+      refreshToken: rawToken,
+      refreshExpiresAt: new Date(refreshExpiresAt).toISOString(),
+      nextRefreshTokens: [...(existingTokens || []), entry],
+    };
+  }
+
+  function revokeRefreshTokenFamilies(tokens, predicate) {
+    const now = Date.now();
+    const familyIds = new Set();
+    for (const entry of tokens || []) {
+      if (predicate(entry) && entry.familyId) {
+        familyIds.add(entry.familyId);
+      }
+    }
+    if (familyIds.size === 0) return tokens || [];
+    return (tokens || []).map((entry) =>
+      familyIds.has(entry.familyId) && !entry.revokedAt ? { ...entry, revokedAt: now } : entry
+    );
   }
 
   function readLocalCatalog() {
@@ -276,11 +333,14 @@ export function createLocalServerApp(customOptions = {}) {
       updatedAt: state.updatedAt,
       baseUpdatedAt: state.baseUpdatedAt || state.updatedAt,
       lastCloudSyncAt: state.lastCloudSyncAt || null,
+      hasPendingLocalChanges: Boolean(state.hasPendingLocalChanges),
+      serverSavedAt: state.serverSavedAt || state.updatedAt || null,
     };
   }
 
   function writeLocalCatalog(state, meta = {}) {
     const now = new Date().toISOString();
+    const hasCloudSyncTimestamp = Boolean(meta.lastCloudSyncAt);
     const next = {
       restaurants: state.restaurants || [],
       categories: state.categories || [],
@@ -289,6 +349,7 @@ export function createLocalServerApp(customOptions = {}) {
       updatedAt: state.updatedAt || now,
       baseUpdatedAt: state.baseUpdatedAt || state.updatedAt || now,
       lastCloudSyncAt: meta.lastCloudSyncAt ?? state.lastCloudSyncAt ?? null,
+      hasPendingLocalChanges: !hasCloudSyncTimestamp,
       serverSavedAt: now,
     };
     atomicWriteFile(dataFile, JSON.stringify(next, null, 2));
@@ -518,6 +579,7 @@ export function createLocalServerApp(customOptions = {}) {
       hasLocalSnapshot: Boolean(state),
       pinConfigured: Boolean(authRecord.pinHash),
       lastCloudSyncAt: state?.lastCloudSyncAt || null,
+      hasPendingLocalChanges: Boolean(state?.hasPendingLocalChanges),
       cachedImagesCount: Object.keys(imageMap).length,
       updatedAt: state?.updatedAt || null,
     });
@@ -534,11 +596,18 @@ export function createLocalServerApp(customOptions = {}) {
       hasSuperAdmin,
       authenticated: Boolean(session?.account),
       user: session?.account ?? null,
+      localhostSetupAllowed: isLocalhostRequest(req),
     });
   });
 
-  // First-run Super Admin setup (atomic check: only works when zero active super_admin exists)
+  // First-run Super Admin setup (restricted to localhost PC and zero existing active super_admin)
   app.post('/api/auth/setup-admin', (req, res) => {
+    if (!isLocalhostRequest(req)) {
+      return res.status(403).json({
+        error: 'Création initiale du Super Admin autorisée uniquement depuis le PC serveur (localhost).',
+      });
+    }
+
     const authRecord = readAuthRecord();
     const accounts = authRecord.accounts || [];
     if (accounts.some((a) => a.role === 'super_admin' && a.isActive)) {
@@ -589,9 +658,19 @@ export function createLocalServerApp(customOptions = {}) {
       revokedBefore: 0,
     };
 
+    const { refreshToken, refreshExpiresAt, nextRefreshTokens } = createRefreshTokenEntry(
+      authRecord.refreshTokens,
+      {
+        sub: adminAccount.id,
+        role: 'super_admin',
+        restaurantId: null,
+      }
+    );
+
     writeAuthRecord({
       ...authRecord,
       accounts: [...accounts, adminAccount],
+      refreshTokens: nextRefreshTokens,
       updatedAt: nowIso,
     });
 
@@ -612,11 +691,13 @@ export function createLocalServerApp(customOptions = {}) {
     return res.json({
       ok: true,
       token,
+      refreshToken,
+      refreshExpiresAt,
       user: sanitizeAccount(adminAccount),
     });
   });
 
-  // Username + Password login -> returns signed HMAC Bearer token
+  // Username + Password login -> returns signed HMAC Bearer token + single-use rotating refresh token
   app.post('/api/auth/login', (req, res) => {
     const clientKey = getClientKey(req);
     const limit = checkRateLimit(clientKey);
@@ -655,6 +736,20 @@ export function createLocalServerApp(customOptions = {}) {
 
     clearFailedAttempts(clientKey);
 
+    const { refreshToken, refreshExpiresAt, nextRefreshTokens } = createRefreshTokenEntry(
+      authRecord.refreshTokens,
+      {
+        sub: account.id,
+        role: account.role,
+        restaurantId: account.assignedRestaurantId ?? null,
+      }
+    );
+    writeAuthRecord({
+      ...authRecord,
+      refreshTokens: nextRefreshTokens,
+      updatedAt: new Date().toISOString(),
+    });
+
     const now = Date.now();
     const ttlMs = (config.sessionTtlMinutes || 480) * 60 * 1000;
     const token = signSessionToken(
@@ -672,7 +767,115 @@ export function createLocalServerApp(customOptions = {}) {
     return res.json({
       ok: true,
       token,
+      refreshToken,
+      refreshExpiresAt,
       user: sanitizeAccount(account),
+    });
+  });
+
+  // Single-use refresh token rotation with token-family reuse detection
+  app.post('/api/auth/refresh', (req, res) => {
+    const clientKey = getClientKey(req);
+    const limit = checkRateLimit(clientKey);
+    if (limit.blocked) {
+      return res.status(429).json({
+        error: `Trop de tentatives. Réessayez dans ${limit.retryAfterSeconds}s.`,
+        retryAfterSeconds: limit.retryAfterSeconds,
+      });
+    }
+
+    const rawRefresh = String(req.body?.refreshToken || '').trim();
+    if (!rawRefresh) {
+      return res.status(400).json({ ok: false, error: 'Jeton de renouvellement manquant.', reason: 'invalid_refresh_token' });
+    }
+
+    const authRecord = readAuthRecord();
+    const tokenHash = hashRefreshToken(rawRefresh);
+    const tokens = authRecord.refreshTokens || [];
+    const entry = tokens.find((t) => t.tokenHash === tokenHash);
+
+    if (!entry) {
+      return res.status(401).json({ ok: false, error: 'Session expirée ou invalide.', reason: 'invalid_refresh_token' });
+    }
+
+    if (entry.usedAt || entry.revokedAt) {
+      const revokedTokens = revokeRefreshTokenFamilies(tokens, (t) => t.familyId === entry.familyId);
+      writeAuthRecord({
+        ...authRecord,
+        refreshTokens: revokedTokens,
+        updatedAt: new Date().toISOString(),
+      });
+      return res.status(401).json({ ok: false, error: 'Session révoquée.', reason: 'revoked' });
+    }
+
+    const now = Date.now();
+    if (now >= entry.expiresAt) {
+      return res.status(401).json({ ok: false, error: 'Session expirée.', reason: 'expired' });
+    }
+
+    let account = null;
+    if (entry.sub) {
+      account = (authRecord.accounts || []).find((a) => a.id === entry.sub) || null;
+      if (!account || !account.isActive) {
+        const revokedTokens = revokeRefreshTokenFamilies(tokens, (t) => t.sub === entry.sub);
+        writeAuthRecord({
+          ...authRecord,
+          refreshTokens: revokedTokens,
+          updatedAt: new Date().toISOString(),
+        });
+        return res.status(401).json({ ok: false, error: 'Compte inactif ou introuvable.', reason: 'inactive' });
+      }
+      if (account.revokedBefore && entry.createdAt <= account.revokedBefore) {
+        const revokedTokens = revokeRefreshTokenFamilies(tokens, (t) => t.familyId === entry.familyId);
+        writeAuthRecord({
+          ...authRecord,
+          refreshTokens: revokedTokens,
+          updatedAt: new Date().toISOString(),
+        });
+        return res.status(401).json({ ok: false, error: 'Session révoquée.', reason: 'revoked' });
+      }
+    }
+
+    const effectiveRole = account ? account.role : entry.role;
+    const effectiveRestaurantId = account ? (account.assignedRestaurantId ?? null) : (entry.restaurantId ?? null);
+
+    const markedUsed = tokens.map((t) => (t.id === entry.id ? { ...t, usedAt: now } : t));
+    const { refreshToken, refreshExpiresAt, nextRefreshTokens } = createRefreshTokenEntry(
+      markedUsed,
+      {
+        familyId: entry.familyId,
+        sub: entry.sub ?? null,
+        role: effectiveRole,
+        restaurantId: effectiveRestaurantId,
+      }
+    );
+
+    writeAuthRecord({
+      ...authRecord,
+      refreshTokens: nextRefreshTokens,
+      updatedAt: new Date(now).toISOString(),
+    });
+
+    const ttlMs = (config.sessionTtlMinutes || 480) * 60 * 1000;
+    const accessPayload = {
+      jti: crypto.randomUUID(),
+      ...(entry.sub ? { sub: entry.sub } : {}),
+      role: effectiveRole,
+      restaurantId: effectiveRestaurantId,
+      iat: now,
+      exp: now + ttlMs,
+    };
+    const token = signSessionToken(accessPayload, authRecord.tokenSecret);
+
+    return res.json({
+      ok: true,
+      token,
+      refreshToken,
+      refreshExpiresAt,
+      user: account ? sanitizeAccount(account) : null,
+      role: effectiveRole,
+      restaurantId: effectiveRestaurantId,
+      expiresAt: new Date(accessPayload.exp).toISOString(),
     });
   });
 
@@ -688,6 +891,20 @@ export function createLocalServerApp(customOptions = {}) {
     const session = resolveRequestSession(req);
     if (session?.jti) {
       revokedJtis.add(session.jti);
+    }
+    const rawRefresh = String(req.body?.refreshToken || '').trim();
+    if (rawRefresh) {
+      const authRecord = readAuthRecord();
+      const targetHash = hashRefreshToken(rawRefresh);
+      const nextRefreshTokens = revokeRefreshTokenFamilies(
+        authRecord.refreshTokens,
+        (t) => t.tokenHash === targetHash
+      );
+      writeAuthRecord({
+        ...authRecord,
+        refreshTokens: nextRefreshTokens,
+        updatedAt: new Date().toISOString(),
+      });
     }
     return res.json({ ok: true });
   });
@@ -747,7 +964,15 @@ export function createLocalServerApp(customOptions = {}) {
       return res.status(404).json({ error: 'Compte introuvable.' });
     }
 
-    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    const nextRefreshTokens = pwd
+      ? revokeRefreshTokenFamilies(authRecord.refreshTokens, (t) => t.sub === session.sub)
+      : authRecord.refreshTokens;
+    writeAuthRecord({
+      ...authRecord,
+      accounts: nextAccounts,
+      refreshTokens: nextRefreshTokens,
+      updatedAt: new Date().toISOString(),
+    });
     return res.json({ ok: true, user: sanitizeAccount(updatedAccount) });
   });
 
@@ -787,7 +1012,16 @@ export function createLocalServerApp(customOptions = {}) {
         : acc
     );
 
-    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    const nextRefreshTokens = revokeRefreshTokenFamilies(
+      authRecord.refreshTokens,
+      (t) => t.sub === session.sub
+    );
+    writeAuthRecord({
+      ...authRecord,
+      accounts: nextAccounts,
+      refreshTokens: nextRefreshTokens,
+      updatedAt: new Date().toISOString(),
+    });
     return res.json({ ok: true });
   });
 
@@ -937,7 +1171,16 @@ export function createLocalServerApp(customOptions = {}) {
       return res.status(404).json({ error: 'Compte introuvable.' });
     }
 
-    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    const nextRefreshTokens = revokeRefreshTokenFamilies(
+      authRecord.refreshTokens,
+      (t) => t.sub === targetId
+    );
+    writeAuthRecord({
+      ...authRecord,
+      accounts: nextAccounts,
+      refreshTokens: nextRefreshTokens,
+      updatedAt: new Date().toISOString(),
+    });
     return res.json({ ok: true });
   });
 
@@ -967,7 +1210,16 @@ export function createLocalServerApp(customOptions = {}) {
       return res.status(404).json({ error: 'Compte introuvable.' });
     }
 
-    writeAuthRecord({ ...authRecord, accounts: nextAccounts, updatedAt: new Date().toISOString() });
+    const nextRefreshTokens = !isActive
+      ? revokeRefreshTokenFamilies(authRecord.refreshTokens, (t) => t.sub === targetId)
+      : authRecord.refreshTokens;
+
+    writeAuthRecord({
+      ...authRecord,
+      accounts: nextAccounts,
+      refreshTokens: nextRefreshTokens,
+      updatedAt: new Date().toISOString(),
+    });
     return res.json({ ok: true });
   });
 
@@ -1121,6 +1373,20 @@ export function createLocalServerApp(customOptions = {}) {
       });
     }
 
+    const { refreshToken, refreshExpiresAt, nextRefreshTokens } = createRefreshTokenEntry(
+      authRecord.refreshTokens,
+      {
+        sub: null,
+        role: 'restaurateur',
+        restaurantId: resolvedRestaurantId,
+      }
+    );
+    writeAuthRecord({
+      ...authRecord,
+      refreshTokens: nextRefreshTokens,
+      updatedAt: new Date().toISOString(),
+    });
+
     const now = Date.now();
     const ttlMs = (config.sessionTtlMinutes || 480) * 60 * 1000;
     const payload = {
@@ -1135,25 +1401,49 @@ export function createLocalServerApp(customOptions = {}) {
     return res.json({
       ok: true,
       token,
+      refreshToken,
+      refreshExpiresAt,
       role: payload.role,
       restaurantId: payload.restaurantId,
       expiresAt: new Date(payload.exp).toISOString(),
     });
   });
 
-  // Revoke active local session token
+  // Revoke active local session token + refresh family
   app.post('/api/auth/local-logout', (req, res) => {
     const session = resolveRequestSession(req);
     if (session?.jti) {
       revokedJtis.add(session.jti);
     }
+    const rawRefresh = String(req.body?.refreshToken || '').trim();
+    if (rawRefresh) {
+      const authRecord = readAuthRecord();
+      const targetHash = hashRefreshToken(rawRefresh);
+      const nextRefreshTokens = revokeRefreshTokenFamilies(
+        authRecord.refreshTokens,
+        (t) => t.tokenHash === targetHash
+      );
+      writeAuthRecord({
+        ...authRecord,
+        refreshTokens: nextRefreshTokens,
+        updatedAt: new Date().toISOString(),
+      });
+    }
     return res.json({ ok: true });
   });
 
   // Protected cloud-to-local pull trigger (authenticated Pro only)
-  app.post('/api/sync/pull-cloud', requireLocalProAuth, async (_req, res) => {
-    const result = await pullCloudFn({ timeoutMs: 8000, quiet: true });
-    return res.status(result.ok ? 200 : 503).json(result);
+  app.post('/api/sync/pull-cloud', requireLocalProAuth, async (req, res) => {
+    const result = await pullCloudFn({
+      timeoutMs: 8000,
+      quiet: true,
+      force: Boolean(req.body?.force),
+    });
+    if (result.ok) {
+      return res.status(200).json(result);
+    }
+    const status = result.reason === 'local_changes_pending_preserved' ? 409 : 503;
+    return res.status(status).json(result);
   });
 
   // Public QR client read endpoint (strictly read-only, zero credentials exposed)
@@ -1198,16 +1488,19 @@ export function createLocalServerApp(customOptions = {}) {
       }
     }
 
-    if (
-      existing &&
-      baseUpdatedAt &&
-      existing.updatedAt &&
-      existing.updatedAt > baseUpdatedAt
-    ) {
-      return res.status(409).json({
-        error: 'Conflit : le catalogue du serveur local a été modifié plus récemment.',
-        serverState: scopeStateForRestaurant(existing),
-      });
+    if (existing && baseUpdatedAt && existing.updatedAt) {
+      const existingMs = Date.parse(existing.updatedAt);
+      const baseMs = Date.parse(baseUpdatedAt);
+      const hasConflict =
+        Number.isFinite(existingMs) && Number.isFinite(baseMs)
+          ? existingMs > baseMs + 2000
+          : existing.updatedAt > baseUpdatedAt;
+      if (hasConflict) {
+        return res.status(409).json({
+          error: 'Conflit : le catalogue du serveur local a été modifié plus récemment.',
+          serverState: scopeStateForRestaurant(existing),
+        });
+      }
     }
 
     const committed = writeLocalCatalog(state, { lastCloudSyncAt });
@@ -1240,9 +1533,9 @@ export function createLocalServerApp(customOptions = {}) {
       }
     }
 
-    const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    const match = dataUrl.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,(.+)$/i);
     if (!match) {
-      return res.status(400).json({ error: 'Invalid base64 image dataUrl.' });
+      return res.status(400).json({ error: 'Format d’image non autorisé (JPEG, PNG ou WebP uniquement).' });
     }
 
     const safeRestId = String(restaurantId).replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -1253,10 +1546,21 @@ export function createLocalServerApp(customOptions = {}) {
       .replace(/\.[^.]+$/, '');
     const finalName = `${Date.now()}-${baseName}.${ext}`;
 
-    const destDir = path.join(uploadsDir, safeRestId, safeFolder);
-    fs.mkdirSync(destDir, { recursive: true });
+    const destDir = path.resolve(uploadsDir, safeRestId, safeFolder);
+    const baseUploadsDir = path.resolve(uploadsDir);
+    if (!destDir.startsWith(baseUploadsDir + path.sep)) {
+      return res.status(400).json({ error: 'Chemin de destination invalide.' });
+    }
     const buffer = Buffer.from(match[2], 'base64');
-    fs.writeFileSync(path.join(destDir, finalName), buffer);
+    if (buffer.length > 500_000) {
+      return res.status(413).json({ error: 'Image trop volumineuse (max 500 Ko).' });
+    }
+    const destFile = path.resolve(destDir, finalName);
+    if (!destFile.startsWith(destDir + path.sep)) {
+      return res.status(400).json({ error: 'Nom de fichier invalide.' });
+    }
+    fs.mkdirSync(destDir, { recursive: true });
+    fs.writeFileSync(destFile, buffer);
 
     return res.json({
       url: `/local-uploads/${safeRestId}/${safeFolder}/${finalName}`,
@@ -1274,8 +1578,9 @@ export function createLocalServerApp(customOptions = {}) {
     if (!fileName) {
       return res.status(404).end();
     }
-    const fullPath = path.join(imageCacheDir, path.basename(fileName));
-    if (!fs.existsSync(fullPath)) {
+    const baseCacheDir = path.resolve(imageCacheDir);
+    const fullPath = path.resolve(baseCacheDir, path.basename(fileName));
+    if (!fullPath.startsWith(baseCacheDir + path.sep) || !fs.existsSync(fullPath)) {
       return res.status(404).end();
     }
     res.setHeader('Cache-Control', 'public, max-age=2592000');

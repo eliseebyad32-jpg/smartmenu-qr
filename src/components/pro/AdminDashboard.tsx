@@ -21,10 +21,13 @@ import {
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
 import { isSupabaseConfigured } from '../../services/supabaseClient';
-import { uploadAssetToSupabaseStorage } from '../../services/supabaseData';
+import {
+  hasSupabaseAuthSession,
+  uploadAssetToSupabaseStorage,
+} from '../../services/supabaseData';
 import { uploadAssetToLocalServer } from '../../services/syncService';
 import { MenuItem, PlatformUser, Restaurant } from '../../types/menu';
-import { readAndOptimizeImageBlob } from '../../utils/imageUpload';
+import { isSafeRasterDataUrl, readAndOptimizeImageBlob } from '../../utils/imageUpload';
 
 const COLOR_SWATCHES = ['#DC2626', '#EA580C', '#E11D48', '#D97706', '#059669', '#2563EB'];
 
@@ -272,23 +275,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleEditLogoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !editingRest) return;
+    if (file.type.toLowerCase().includes('svg')) {
+      showToast(t.toast.validationError, 'error');
+      return;
+    }
     setUploadingLogo(true);
     try {
       const optimized = await readAndOptimizeImageBlob(file, 400);
+      if (!isSafeRasterDataUrl(optimized.dataUrl)) {
+        showToast(t.toast.validationError, 'error');
+        return;
+      }
       if (isSupabaseConfigured() && navigator.onLine) {
-        try {
-          const publicUrl = await uploadAssetToSupabaseStorage(
-            editingRest.id,
-            'logos',
-            `logo.${optimized.extension}`,
-            optimized.blob,
-            optimized.contentType
-          );
-          setEditingRest((prev) => (prev ? { ...prev, logoUrl: publicUrl } : prev));
+        const hasJwt = await hasSupabaseAuthSession();
+        if (hasJwt) {
+          try {
+            const publicUrl = await uploadAssetToSupabaseStorage(
+              editingRest.id,
+              'logos',
+              `logo.${optimized.extension}`,
+              optimized.blob,
+              optimized.contentType
+            );
+            setEditingRest((prev) => (prev ? { ...prev, logoUrl: publicUrl } : prev));
+            showToast(t.toast.uploadSuccess);
+            return;
+          } catch {
+            // Fall through to safe bounded inline logo
+          }
+        } else {
+          setEditingRest((prev) => (prev ? { ...prev, logoUrl: optimized.dataUrl } : prev));
           showToast(t.toast.uploadSuccess);
           return;
-        } catch {
-          // Fall through to local PC server or inline dataUrl
         }
       }
       const localUrl = await uploadAssetToLocalServer(

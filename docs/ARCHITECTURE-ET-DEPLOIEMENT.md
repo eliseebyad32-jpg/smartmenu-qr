@@ -8,22 +8,22 @@
   - `src/components/pro/` : Authentification multi-rôles (`ProAuthGate`), tableau de bord Super Admin (`AdminDashboard`), espace Restaurateur isolé (`RestaurateurDashboard`) et gestionnaire de catalogue (`ProductManager`).
 - **Couche Hors Ligne & Synchronisation**
   - `vite.config.ts` (`vite-plugin-pwa` + Workbox) : Génère le manifeste PWA et met en cache l'application, les polices et les images WebP/JPG. **Une première visite connectée est indispensable pour mettre le menu en cache avant toute consultation hors ligne.**
-  - `src/services/offlineStore.ts` : Stockage **IndexedDB** (`catalog_v2` + `sync_outbox`) avec repli `localStorage`.
-  - `src/services/syncService.ts` : Synchronisation optimiste avec détection de conflit (`HTTP 409`) et résolution manuelle sans perte silencieuse.
+  - `src/services/offlineStore.ts` : Stockage **IndexedDB** (`catalog_v2`, `sync_outbox`, jetons renouvelables hachés) avec repli `localStorage`, file ordonnée par dépendances et fusion automatique des éditions successives.
+  - `src/services/syncService.ts` : Synchronisation optimiste à verrou unique, réessais automatiques progressifs, résolution ciblée des conflits sans perte des autres modifications et repli transparent vers le serveur local Wi-Fi.
 - **Serveur Local Wi-Fi Windows**
-  - `local-server/server.mjs` : Serveur Express autonome pour héberger le build `dist/` et l'API locale `/api/catalog` sur le réseau Wi-Fi du restaurant.
+  - `local-server/server.mjs` & `local-server/sync-cloud.mjs` : Serveur Express autonome hébergeant le build `dist/`, l'API locale `/api/catalog` (avec protection des modifications locales en attente), les médias `/local-uploads/*` et le miroir `/api/cached-image` sur le réseau Wi-Fi du restaurant.
 - **Images optimisées**
-  - `src/assets/images/*-thumb.webp` (miniatures 280px, ~7 à 14 Ko) et `*-md.webp` (800px) servies via `<picture>` + `loading="lazy"` + dimensions explicites.
+  - `src/assets/images/*-thumb.webp` (miniatures 280px, ~7 à 14 Ko) et `*-md.webp` (800px) servies via `<picture>` + `loading="lazy"` + dimensions explicites, avec repli automatique vers le miroir local `/api/cached-image`.
 
 ---
 
 ## 2. Configuration Supabase (Production Cloud)
 
-L'application fonctionne actuellement avec une persistance locale de démonstration. Pour activer la base PostgreSQL, l'authentification et le stockage cloud :
+Pour activer la base PostgreSQL, l'authentification renouvelable et le stockage cloud :
 
 1. Créer un projet sur [supabase.com](https://supabase.com).
-2. Exécuter l'intégralité du fichier **`supabase/schema.sql`** dans le **SQL Editor** Supabase (crée `restaurants`, `profiles`, `categories`, `menu_items`, le bucket Storage `restaurant-assets` et les politiques **RLS** par `restaurant_id`).
-3. Dans **Authentication → Users**, créer les utilisateurs et insérer leurs rôles (`super_admin` ou `restaurateur` + `restaurant_id`) dans `public.profiles`.
+2. Exécuter le script SQL idempotent **`supabase/schema.sql`** (ou ses parties validées) dans le **SQL Editor** Supabase (crée `restaurants`, `profiles`, `app_credentials`, `app_sessions`, `app_refresh_tokens`, `categories`, `menu_items`, le bucket Storage `restaurant-assets`, les fonctions RPC sécurisées et les politiques **RLS** par `restaurant_id`).
+3. Initialiser le compte Super Admin depuis l'interface Pro (ou vérifier les profils dans `public.profiles`) et créer les comptes restaurateurs depuis le tableau de bord.
 4. Configurer uniquement les clés publiques dans `.env` (ne jamais exposer `SUPABASE_SERVICE_ROLE_KEY` avec un préfixe `VITE_`) :
    ```env
    VITE_SUPABASE_URL="https://VOTRE-PROJET.supabase.co"
@@ -43,8 +43,9 @@ L'application fonctionne actuellement avec une persistance locale de démonstrat
 
 ---
 
-## 4. Limites techniques actuelles & Prochaines étapes
+## 4. Limites techniques & Notes d'exploitation
 
-- **Authentification & Base de données** : Tant que `VITE_SUPABASE_URL` et `VITE_SUPABASE_ANON_KEY` ne sont pas renseignées, l'authentification et les modifications restent stockées localement dans le navigateur (ou sur le serveur local Node si lancé).
-- **Commandes en salle** : Le panier permet au client de composer sa sélection et de copier/présenter le récapitulatif, mais n'envoie pas de commande vers une cuisine ou caisse POS tant qu'un endpoint de réception temps réel n'est pas branché.
-- **Serveur Windows** : Nécessite une installation manuelle sur le PC du restaurant selon `docs/WINDOWS-LOCAL-SERVER.md`.
+- **Authentification & Base de données** : Sans `VITE_SUPABASE_URL` ni `VITE_SUPABASE_ANON_KEY`, l'authentification et les modifications utilisent le serveur local PC Windows (`local-server/data/`) ou le stockage local du navigateur.
+- **Commandes en salle** : Le panier permet au client de composer sa sélection et de copier/présenter le récapitulatif, sans transmission automatique en cuisine tant qu'un endpoint POS temps réel n'est pas branché.
+- **Serveur Windows** : Déployé sur le PC du restaurant via `INSTALLER-SMARTMENU-WINDOWS.bat` et `docs/WINDOWS-LOCAL-SERVER.md`.
+

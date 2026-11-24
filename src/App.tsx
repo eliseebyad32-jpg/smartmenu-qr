@@ -17,7 +17,6 @@ import {
   INITIAL_CATEGORIES,
   INITIAL_MENU_ITEMS,
   INITIAL_RESTAURANTS,
-  INITIAL_USERS,
 } from './data/seedData';
 import {
   getLastConsultedRestaurant,
@@ -31,6 +30,7 @@ import {
   loadOutbox,
   loadPlatformState,
   PlatformState,
+  replaceOutbox,
   savePlatformState,
   setLastSyncedAt,
   SyncEntityType,
@@ -49,6 +49,8 @@ import {
   PermissionError,
 } from './services/permissions';
 import {
+  buildNonConflictingServerMerge,
+  canActorReplayMutation,
   changeOwnLocalPassword,
   createLocalServerOwner,
   fetchLocalServerInfo,
@@ -56,6 +58,8 @@ import {
   listLocalServerUsers,
   reassignLocalServerOwner,
   resetLocalServerUserPassword,
+  restoreLocalServerSession,
+  SyncConflictDetail,
   syncPendingOutboxWithSupabase,
   SyncStatus,
   syncWithServer,
@@ -146,9 +150,7 @@ function SmartMenuShell() {
   const [menuItems, setMenuItems] = useState<MenuItem[]>(
     supabaseEnabled ? initialCachedSnapshot?.menuItems ?? [] : INITIAL_MENU_ITEMS
   );
-  const [users, setUsers] = useState<PlatformUser[]>(
-    supabaseEnabled ? initialCachedSnapshot?.users ?? [] : INITIAL_USERS
-  );
+  const [users, setUsers] = useState<PlatformUser[]>([]);
   const [updatedAt, setUpdatedAt] = useState<string>(
     initialCachedSnapshot?.updatedAt ?? new Date().toISOString()
   );
@@ -191,7 +193,18 @@ function SmartMenuShell() {
   const [currentProUser, setCurrentProUser] = useState<PlatformUser | null>(null);
   const [lastSyncedAt, setLastSyncedAtState] = useState<string | null>(() => getLastSyncedAt());
   const [conflictServerState, setConflictServerState] = useState<PlatformState | null>(null);
+  const [conflictDetails, setConflictDetails] = useState<SyncConflictDetail[]>([]);
+  const [autoRetryAt, setAutoRetryAt] = useState<string | null>(null);
+  const [retryStoppedPermanent, setRetryStoppedPermanent] = useState<boolean>(false);
   const lastCloudSyncRef = useRef<number>(0);
+  const lastForegroundProbeRef = useRef<number>(0);
+  const inFlightCloudSyncRef = useRef<Promise<void> | null>(null);
+  const queuedCloudResyncRef = useRef<{
+    force: boolean;
+    forceOverwrite: boolean;
+    respectBackoff: boolean;
+  } | null>(null);
+  const inFlightLocalSyncRef = useRef<Promise<void> | null>(null);
 
   const activeViewRef = useRef(activeView);
   activeViewRef.current = activeView;
@@ -209,6 +222,12 @@ function SmartMenuShell() {
   localServerActiveRef.current = localServerActive;
   const currentProUserRef = useRef<PlatformUser | null>(currentProUser);
   currentProUserRef.current = currentProUser;
+  const baseUpdatedAtRef = useRef(baseUpdatedAt);
+  baseUpdatedAtRef.current = baseUpdatedAt;
+  const syncStatusRef = useRef(syncStatus);
+  syncStatusRef.current = syncStatus;
+  const pendingCountRef = useRef(pendingCount);
+  pendingCountRef.current = pendingCount;
 
   const applyAndCacheCloudState = useCallback(
     async (
@@ -232,6 +251,7 @@ function SmartMenuShell() {
       }
       setUpdatedAt(now);
       setBaseUpdatedAt(now);
+      baseUpdatedAtRef.current = now;
       setLastSyncedAt(now);
       setLastSyncedAtState(now);
 
@@ -252,7 +272,7 @@ function SmartMenuShell() {
         restaurants: nextRestaurants,
         categories: nextCategories,
         menuItems: nextItems,
-        users: nextUsers ?? usersRef.current,
+        users: [],
         updatedAt: now,
         baseUpdatedAt: now,
       });
@@ -268,6 +288,7 @@ function SmartMenuShell() {
         void syncWithServer(saved, true, {
           lastCloudSyncAt: now,
           pushOnlyToLocal: true,
+          actor: currentProUserRef.current,
         });
       }
     },
@@ -275,181 +296,310 @@ function SmartMenuShell() {
   );
 
   const refreshFromSupabase = useCallback(
-    async (force = false, forceOverwriteConflicts = false) => {
+    async (
+      force = false,
+      forceOverwriteConflicts = false,
+      respectBackoff = false
+    ): Promise<void> => {
       if (!isSupabaseEnvConfigured()) return;
 
-      const outbox = await loadOutbox();
-      setPendingCount(outbox.length);
-
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        setSyncStatus('offline');
-        // Even without Internet WAN, check if a local PC Wi-Fi server can serve catalog updates
-        const localProbe = await syncWithServer(
-          {
-            restaurants: restaurantsRef.current,
-            categories: categoriesRef.current,
-            menuItems: menuItemsRef.current,
-            users: usersRef.current,
-            updatedAt: new Date().toISOString(),
-            baseUpdatedAt,
-          },
-          false,
-          { pullOnly: true }
-        );
-        if (localProbe.localServerActive) {
-          setLocalServerActive(true);
-          if (localProbe.mergedState && localProbe.mergedState.restaurants.length > 0) {
-            await applyAndCacheCloudState(
-              localProbe.mergedState.restaurants,
-              localProbe.mergedState.categories,
-              localProbe.mergedState.menuItems,
-              localProbe.mergedState.users
-            );
-          }
-        }
-        setIsCloudBootstrapping(false);
-        return;
+      if (inFlightCloudSyncRef.current) {
+        const prev = queuedCloudResyncRef.current;
+        queuedCloudResyncRef.current = {
+          force: Boolean(prev?.force || force),
+          forceOverwrite: Boolean(prev?.forceOverwrite || forceOverwriteConflicts),
+          respectBackoff: prev ? prev.respectBackoff && respectBackoff : respectBackoff,
+        };
+        return inFlightCloudSyncRef.current;
       }
 
-      if (
-        !force &&
-        outbox.length === 0 &&
-        lastCloudSyncRef.current > 0 &&
-        Date.now() - lastCloudSyncRef.current < 15_000
-      ) {
-        return;
-      }
+      const executeRefresh = async () => {
+        const outbox = await loadOutbox();
+        setPendingCount(outbox.length);
 
-      setSyncStatus('syncing');
-      try {
-        // Replay queued offline mutations before pulling fresh cloud data so edits are never lost
-        if (outbox.length > 0) {
-          const replayResult = await syncPendingOutboxWithSupabase(
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          setSyncStatus('offline');
+          // Even without Internet WAN, check if a local PC Wi-Fi server can serve catalog updates
+          const localProbe = await syncWithServer(
             {
               restaurants: restaurantsRef.current,
               categories: categoriesRef.current,
               menuItems: menuItemsRef.current,
               users: usersRef.current,
               updatedAt: new Date().toISOString(),
-              baseUpdatedAt,
+              baseUpdatedAt: baseUpdatedAtRef.current,
             },
-            forceOverwriteConflicts
+            false,
+            { pullOnly: true }
           );
-          setPendingCount(replayResult.pendingCount);
-
-          if (replayResult.status === 'conflict' && replayResult.serverConflictState) {
-            setConflictServerState(replayResult.serverConflictState);
-            setSyncStatus('conflict');
-            setIsCloudBootstrapping(false);
-            return;
+          if (localProbe.localServerActive) {
+            setLocalServerActive(true);
+            localServerActiveRef.current = true;
+            if (
+              localProbe.mergedState &&
+              localProbe.mergedState.restaurants.length > 0 &&
+              outbox.length === 0
+            ) {
+              await applyAndCacheCloudState(
+                localProbe.mergedState.restaurants,
+                localProbe.mergedState.categories,
+                localProbe.mergedState.menuItems,
+                localProbe.mergedState.users
+              );
+            }
           }
-
-          if (replayResult.status === 'error') {
-            setSyncStatus('error');
-            setIsCloudBootstrapping(false);
-            return;
-          }
-
-          if (replayResult.mergedState) {
-            await applyAndCacheCloudState(
-              replayResult.mergedState.restaurants,
-              replayResult.mergedState.categories,
-              replayResult.mergedState.menuItems,
-              replayResult.mergedState.users
-            );
-            lastCloudSyncRef.current = Date.now();
-            setSyncStatus('online');
-            setPendingCount(0);
-            setIsCloudBootstrapping(false);
-            return;
-          }
+          setIsCloudBootstrapping(false);
+          return;
         }
 
-        const sb = await loadSupabaseData();
-        const urlSlug = getInitialRestaurantSlug();
-
-        // On QR-code customer scans (?restaurant=<slug>), fetch only the target venue's menu first
-        if (activeViewRef.current === 'customer' && urlSlug) {
-          const scoped = await sb.fetchSupabaseRestaurantCatalogBySlug(urlSlug);
-          if (scoped && scoped.restaurants.length > 0) {
-            const targetRest = scoped.restaurants[0];
-            const mergedRestaurants = restaurantsRef.current.some((r) => r.id === targetRest.id)
-              ? restaurantsRef.current.map((r) => (r.id === targetRest.id ? targetRest : r))
-              : [targetRest, ...restaurantsRef.current];
-            const otherCategories = categoriesRef.current.filter(
-              (c) => c.restaurantId && c.restaurantId !== targetRest.id
-            );
-            const mergedCategories = [...scoped.categories, ...otherCategories];
-            const otherItems = menuItemsRef.current.filter(
-              (m) => m.restaurantId !== targetRest.id
-            );
-            const mergedItems = [...scoped.menuItems, ...otherItems];
-
-            await applyAndCacheCloudState(mergedRestaurants, mergedCategories, mergedItems);
-            lastCloudSyncRef.current = Date.now();
-            setSyncStatus('online');
-            setPendingCount(0);
-            return;
-          }
+        if (
+          !force &&
+          outbox.length === 0 &&
+          lastCloudSyncRef.current > 0 &&
+          Date.now() - lastCloudSyncRef.current < 15_000
+        ) {
+          return;
         }
 
-        const cloud = await sb.fetchSupabaseCatalog(force);
-        await applyAndCacheCloudState(
-          cloud.restaurants,
-          cloud.categories,
-          cloud.menuItems,
-          cloud.users
-        );
-        lastCloudSyncRef.current = Date.now();
-        setSyncStatus('online');
-        setPendingCount(0);
-      } catch {
-        setSyncStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'error');
-      } finally {
-        setIsCloudBootstrapping(false);
-      }
+        setSyncStatus('syncing');
+        try {
+          const sb = await loadSupabaseData();
+
+          // Restore renewable session automatically before replaying queued offline mutations
+          if (outbox.length > 0 && !currentProUserRef.current) {
+            const restored = await sb.restoreSupabaseSession().catch(() => null);
+            if (restored) {
+              currentProUserRef.current = restored;
+              setCurrentProUser(restored);
+            }
+          }
+
+          // Replay queued offline mutations before pulling fresh cloud data so edits are never lost
+          if (outbox.length > 0) {
+            const replayResult = await syncPendingOutboxWithSupabase(
+              {
+                restaurants: restaurantsRef.current,
+                categories: categoriesRef.current,
+                menuItems: menuItemsRef.current,
+                users: [],
+                updatedAt: new Date().toISOString(),
+                baseUpdatedAt: baseUpdatedAtRef.current,
+              },
+              forceOverwriteConflicts,
+              currentProUserRef.current,
+              { respectBackoff }
+            );
+            setPendingCount(replayResult.pendingCount);
+
+            if (replayResult.status === 'conflict' && replayResult.serverConflictState) {
+              setConflictServerState(replayResult.serverConflictState);
+              setConflictDetails(replayResult.conflicts ?? []);
+              setSyncStatus('conflict');
+              setAutoRetryAt(null);
+              setIsCloudBootstrapping(false);
+              return;
+            }
+
+            if (replayResult.status === 'error') {
+              setConflictDetails([]);
+              setSyncStatus('error');
+              if (replayResult.retryable === false) {
+                setRetryStoppedPermanent(true);
+                setAutoRetryAt(null);
+              } else {
+                setRetryStoppedPermanent(false);
+                setAutoRetryAt(
+                  replayResult.nextRetryAt ?? new Date(Date.now() + 10_000).toISOString()
+                );
+              }
+              setIsCloudBootstrapping(false);
+              return;
+            }
+
+            if (replayResult.mergedState) {
+              setConflictDetails([]);
+              await applyAndCacheCloudState(
+                replayResult.mergedState.restaurants,
+                replayResult.mergedState.categories,
+                replayResult.mergedState.menuItems,
+                replayResult.mergedState.users
+              );
+              lastCloudSyncRef.current = Date.now();
+              setSyncStatus('online');
+              setAutoRetryAt(null);
+              setRetryStoppedPermanent(false);
+              setPendingCount(replayResult.pendingCount);
+              setIsCloudBootstrapping(false);
+              return;
+            }
+          }
+
+          const urlSlug = getInitialRestaurantSlug();
+
+          // On QR-code customer scans (?restaurant=<slug>), fetch only the target venue's menu first
+          if (activeViewRef.current === 'customer' && urlSlug) {
+            const scoped = await sb.fetchSupabaseRestaurantCatalogBySlug(urlSlug);
+            if (scoped && scoped.restaurants.length > 0) {
+              const targetRest = scoped.restaurants[0];
+              const mergedRestaurants = restaurantsRef.current.some((r) => r.id === targetRest.id)
+                ? restaurantsRef.current.map((r) => (r.id === targetRest.id ? targetRest : r))
+                : [targetRest, ...restaurantsRef.current];
+              const otherCategories = categoriesRef.current.filter(
+                (c) => c.restaurantId && c.restaurantId !== targetRest.id
+              );
+              const mergedCategories = [...scoped.categories, ...otherCategories];
+              const otherItems = menuItemsRef.current.filter(
+                (m) => m.restaurantId !== targetRest.id
+              );
+              const mergedItems = [...scoped.menuItems, ...otherItems];
+
+              await applyAndCacheCloudState(mergedRestaurants, mergedCategories, mergedItems);
+              lastCloudSyncRef.current = Date.now();
+              setSyncStatus('online');
+              setAutoRetryAt(null);
+              setRetryStoppedPermanent(false);
+              const latestOutbox = await loadOutbox();
+              setPendingCount(latestOutbox.length);
+              return;
+            }
+          }
+
+          const cloud = await sb.fetchSupabaseCatalog(force);
+          await applyAndCacheCloudState(
+            cloud.restaurants,
+            cloud.categories,
+            cloud.menuItems,
+            cloud.users
+          );
+          lastCloudSyncRef.current = Date.now();
+          setSyncStatus('online');
+          setAutoRetryAt(null);
+          setRetryStoppedPermanent(false);
+          const latestOutbox = await loadOutbox();
+          setPendingCount(latestOutbox.length);
+        } catch {
+          // Hybrid fallback: on Wi-Fi LAN without WAN Internet, navigator.onLine may still be true
+          const localProbe = await syncWithServer(
+            {
+              restaurants: restaurantsRef.current,
+              categories: categoriesRef.current,
+              menuItems: menuItemsRef.current,
+              users: usersRef.current,
+              updatedAt: new Date().toISOString(),
+              baseUpdatedAt: baseUpdatedAtRef.current,
+            },
+            false,
+            { pullOnly: true }
+          ).catch(() => null);
+
+          if (localProbe?.localServerActive) {
+            setLocalServerActive(true);
+            localServerActiveRef.current = true;
+            if (
+              localProbe.mergedState &&
+              localProbe.mergedState.restaurants.length > 0 &&
+              outbox.length === 0
+            ) {
+              await applyAndCacheCloudState(
+                localProbe.mergedState.restaurants,
+                localProbe.mergedState.categories,
+                localProbe.mergedState.menuItems,
+                localProbe.mergedState.users
+              );
+            }
+            setSyncStatus('offline');
+            if (pendingCountRef.current > 0) {
+              setRetryStoppedPermanent(false);
+              setAutoRetryAt(new Date(Date.now() + 15_000).toISOString());
+            }
+          } else {
+            const isOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+            setSyncStatus(isOffline ? 'offline' : 'error');
+            if (!isOffline && pendingCountRef.current > 0) {
+              setRetryStoppedPermanent(false);
+              setAutoRetryAt(new Date(Date.now() + 10_000).toISOString());
+            }
+          }
+        } finally {
+          setIsCloudBootstrapping(false);
+        }
+      };
+
+      const runPromise = executeRefresh().finally(() => {
+        inFlightCloudSyncRef.current = null;
+        const queued = queuedCloudResyncRef.current;
+        queuedCloudResyncRef.current = null;
+        if (queued) {
+          void refreshFromSupabase(queued.force, queued.forceOverwrite, queued.respectBackoff);
+        }
+      });
+
+      inFlightCloudSyncRef.current = runPromise;
+      return runPromise;
     },
-    [applyAndCacheCloudState, baseUpdatedAt]
+    [applyAndCacheCloudState]
   );
 
   const runSync = useCallback(
-    async (stateSnapshot: PlatformState, forceOverwrite = false) => {
+    async (stateSnapshot: PlatformState, forceOverwrite = false, respectBackoff = false) => {
       if (isSupabaseEnvConfigured()) {
-        await refreshFromSupabase(true, forceOverwrite);
+        await refreshFromSupabase(true, forceOverwrite, respectBackoff);
         return;
       }
 
-      const allowPush =
-        activeViewRef.current === 'pro' && canPushServerSync(currentProUserRef.current);
+      if (inFlightLocalSyncRef.current) {
+        return inFlightLocalSyncRef.current;
+      }
 
-      setSyncStatus('syncing');
-      const result = await syncWithServer(stateSnapshot, forceOverwrite && allowPush, {
-        pullOnly: !allowPush,
+      const executeLocalSync = async () => {
+        const allowPush =
+          activeViewRef.current === 'pro' && canPushServerSync(currentProUserRef.current);
+
+        setSyncStatus('syncing');
+        const result = await syncWithServer(stateSnapshot, forceOverwrite && allowPush, {
+          pullOnly: !allowPush,
+          actor: currentProUserRef.current,
+        });
+        if (result.localServerActive !== undefined) {
+          setLocalServerActive(result.localServerActive);
+        }
+        if (result.localAuthRequired) {
+          setLocalAuthRequired(true);
+        } else if (result.status === 'online') {
+          setLocalAuthRequired(false);
+        }
+        setPendingCount(result.pendingCount);
+        setSyncStatus(result.status);
+        if (result.status === 'online') {
+          setAutoRetryAt(null);
+          setRetryStoppedPermanent(false);
+        } else if (result.status === 'error' && result.pendingCount > 0) {
+          setRetryStoppedPermanent(Boolean(result.localAuthRequired));
+          setAutoRetryAt(
+            result.localAuthRequired ? null : new Date(Date.now() + 10_000).toISOString()
+          );
+        }
+        if (result.lastSyncedAt) {
+          setLastSyncedAtState(result.lastSyncedAt);
+        }
+
+        if (result.status === 'conflict' && result.serverConflictState) {
+          setConflictServerState(result.serverConflictState);
+          setAutoRetryAt(null);
+        } else if (result.mergedState) {
+          setRestaurants(result.mergedState.restaurants);
+          setCategories(result.mergedState.categories);
+          setMenuItems(result.mergedState.menuItems);
+          setUpdatedAt(result.mergedState.updatedAt);
+          setBaseUpdatedAt(result.mergedState.baseUpdatedAt || result.mergedState.updatedAt);
+        }
+      };
+
+      const localPromise = executeLocalSync().finally(() => {
+        inFlightLocalSyncRef.current = null;
       });
-      if (result.localServerActive !== undefined) {
-        setLocalServerActive(result.localServerActive);
-      }
-      if (result.localAuthRequired) {
-        setLocalAuthRequired(true);
-      } else if (result.status === 'online') {
-        setLocalAuthRequired(false);
-      }
-      setPendingCount(result.pendingCount);
-      setSyncStatus(result.status);
-      if (result.lastSyncedAt) {
-        setLastSyncedAtState(result.lastSyncedAt);
-      }
-
-      if (result.status === 'conflict' && result.serverConflictState) {
-        setConflictServerState(result.serverConflictState);
-      } else if (result.mergedState) {
-        setRestaurants(result.mergedState.restaurants);
-        setCategories(result.mergedState.categories);
-        setMenuItems(result.mergedState.menuItems);
-        setUsers(result.mergedState.users);
-        setUpdatedAt(result.mergedState.updatedAt);
-        setBaseUpdatedAt(result.mergedState.baseUpdatedAt || result.mergedState.updatedAt);
-      }
+      inFlightLocalSyncRef.current = localPromise;
+      return localPromise;
     },
     [refreshFromSupabase]
   );
@@ -468,14 +618,13 @@ function SmartMenuShell() {
       localServerActiveRef.current = serverInfo.active;
 
       if (isSupabaseEnvConfigured()) {
-        // Hydrate from IndexedDB if localStorage snapshot wasn't available, then refresh Supabase
+        // Hydrate from IndexedDB if localStorage snapshot wasn't available, then restore session + refresh Supabase
         if (!initialCachedSnapshot || initialCachedSnapshot.restaurants.length === 0) {
           const cached = await loadPlatformState(false).catch(() => null);
           if (mounted && cached && cached.restaurants.length > 0) {
             setRestaurants(cached.restaurants);
             setCategories(cached.categories);
             setMenuItems(cached.menuItems);
-            setUsers(cached.users);
             setUpdatedAt(cached.updatedAt);
             setBaseUpdatedAt(cached.baseUpdatedAt || cached.updatedAt);
             const urlSlug = getInitialRestaurantSlug();
@@ -486,6 +635,19 @@ function SmartMenuShell() {
             setIsCloudBootstrapping(false);
           }
         }
+        try {
+          const sb = await loadSupabaseData();
+          const restoredUser = await sb.restoreSupabaseSession();
+          if (mounted && restoredUser) {
+            currentProUserRef.current = restoredUser;
+            setCurrentProUser(restoredUser);
+          }
+          if (serverInfo.active) {
+            await restoreLocalServerSession().catch(() => null);
+          }
+        } catch {
+          // Offline or no session; outbox stays safely in IndexedDB
+        }
         await refreshFromSupabase(true);
         return;
       }
@@ -495,7 +657,6 @@ function SmartMenuShell() {
       setRestaurants(state.restaurants);
       setCategories(state.categories);
       setMenuItems(state.menuItems);
-      setUsers(state.users);
       setUpdatedAt(state.updatedAt);
       setBaseUpdatedAt(state.baseUpdatedAt || state.updatedAt);
 
@@ -504,6 +665,14 @@ function SmartMenuShell() {
         const matched = state.restaurants.find((r) => r.slug === urlSlug);
         if (matched) {
           setActiveRestaurantId(matched.id);
+        }
+      }
+
+      if (serverInfo.active) {
+        const restoredLocal = await restoreLocalServerSession().catch(() => ({ ok: false as const }));
+        if (mounted && restoredLocal.ok && restoredLocal.user) {
+          currentProUserRef.current = restoredLocal.user;
+          setCurrentProUser(restoredLocal.user);
         }
       }
 
@@ -528,27 +697,120 @@ function SmartMenuShell() {
       });
     }
 
-    const handleOnline = () => {
+    const handleOnline = async () => {
+      setRetryStoppedPermanent(false);
+      setAutoRetryAt(null);
       if (isSupabaseEnvConfigured()) {
-        refreshFromSupabase(true);
+        if (!currentProUserRef.current) {
+          try {
+            const sb = await loadSupabaseData();
+            const restored = await sb.restoreSupabaseSession();
+            if (restored) {
+              currentProUserRef.current = restored;
+              setCurrentProUser(restored);
+            }
+          } catch {
+            // Ignore transient error
+          }
+        }
+        await refreshFromSupabase(true, false, false);
       } else {
-        loadPlatformState(true).then((latest) => runSync(latest));
+        if (!currentProUserRef.current && localServerActiveRef.current) {
+          const restored = await restoreLocalServerSession().catch(() => ({ ok: false as const }));
+          if (restored.ok && restored.user) {
+            currentProUserRef.current = restored.user;
+            setCurrentProUser(restored.user);
+          }
+        }
+        const latest = await loadPlatformState(true);
+        await runSync(latest, false, false);
       }
     };
     const handleOffline = () => {
       setSyncStatus('offline');
+      setAutoRetryAt(null);
+    };
+
+    const handleForegroundResume = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (syncStatusRef.current === 'conflict' || syncStatusRef.current === 'syncing') return;
+
+      const hasPendingOrError =
+        pendingCountRef.current > 0 || syncStatusRef.current === 'error';
+      const canReachNetwork =
+        typeof navigator === 'undefined' || navigator.onLine || localServerActiveRef.current;
+      if (!canReachNetwork) return;
+
+      const now = Date.now();
+      const throttleMs = hasPendingOrError ? 5_000 : 15_000;
+      if (now - lastForegroundProbeRef.current < throttleMs) return;
+      lastForegroundProbeRef.current = now;
+      void handleOnline();
     };
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    window.addEventListener('focus', handleForegroundResume);
+    document.addEventListener('visibilitychange', handleForegroundResume);
+
+    // Gentle multi-device background refresh (45s) while visible and idle
+    const periodicSyncTimer = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (syncStatusRef.current === 'conflict' || syncStatusRef.current === 'syncing') return;
+      if (pendingCountRef.current > 0) return;
+
+      if (isSupabaseEnvConfigured()) {
+        if (typeof navigator !== 'undefined' && !navigator.onLine && !localServerActiveRef.current) {
+          return;
+        }
+        void refreshFromSupabase(true, false, true);
+      } else if (localServerActiveRef.current) {
+        void loadPlatformState(true).then((latest) => runSync(latest, false, false));
+      }
+    }, 45_000);
 
     return () => {
       mounted = false;
       recoverySub?.unsubscribe();
+      window.clearInterval(periodicSyncTimer);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('focus', handleForegroundResume);
+      document.removeEventListener('visibilitychange', handleForegroundResume);
     };
   }, [initialCachedSnapshot, refreshFromSupabase, runSync]);
+
+  // Automatic exponential-backoff retry scheduler when pending mutations or transient errors exist
+  useEffect(() => {
+    if (syncStatus === 'conflict' || syncStatus === 'syncing' || retryStoppedPermanent) {
+      return;
+    }
+    if (pendingCount === 0 && syncStatus !== 'error') {
+      return;
+    }
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      return;
+    }
+
+    const targetMs = autoRetryAt ? Date.parse(autoRetryAt) : Date.now() + 8_000;
+    const rawDelay = Number.isFinite(targetMs) ? targetMs - Date.now() : 8_000;
+    const jitterMs = Math.floor(Math.random() * 1_000);
+    const delayMs = Math.min(300_000, Math.max(3_000, rawDelay)) + jitterMs;
+
+    const timer = window.setTimeout(async () => {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+      if (isSupabaseEnvConfigured()) {
+        await refreshFromSupabase(true, false, true);
+      } else {
+        const latest = await loadPlatformState(true);
+        await runSync(latest, false, true);
+      }
+    }, delayMs);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [autoRetryAt, pendingCount, refreshFromSupabase, retryStoppedPermanent, runSync, syncStatus]);
 
   useEffect(() => {
     if (supabaseEnabled || !localServerActive || currentProUser?.role !== 'super_admin') {
@@ -649,7 +911,8 @@ function SmartMenuShell() {
       operation: SyncOperation;
       isNew?: boolean;
       payload?: unknown;
-    }
+    },
+    entityBaseUpdatedAt?: string
   ) => {
     const now = new Date().toISOString();
     setRestaurants(nextRestaurants);
@@ -657,50 +920,79 @@ function SmartMenuShell() {
     setMenuItems(nextItems);
     setUsers(nextUsers);
     setUpdatedAt(now);
+    const nextBase = skipOutbox ? now : baseUpdatedAtRef.current;
+    if (skipOutbox) {
+      setBaseUpdatedAt(now);
+      baseUpdatedAtRef.current = now;
+      setLastSyncedAt(now);
+      setLastSyncedAtState(now);
+    }
 
     const saved = await savePlatformState({
       restaurants: nextRestaurants,
       categories: nextCategories,
       menuItems: nextItems,
-      users: nextUsers,
+      users: [],
       updatedAt: now,
-      baseUpdatedAt,
+      baseUpdatedAt: nextBase,
     });
 
-    if (!skipOutbox) {
-      const outbox = await enqueueOutboxMutation(actionLabel, baseUpdatedAt, outboxDetails);
-      setPendingCount(outbox.length);
-      if (isSupabaseEnvConfigured()) {
-        if (
-          localServerActiveRef.current &&
-          activeViewRef.current === 'pro' &&
-          canPushServerSync(currentProUserRef.current)
-        ) {
-          const localRes = await syncWithServer(saved, true, { pushOnlyToLocal: true });
-          if (localRes.localAuthRequired) {
-            setLocalAuthRequired(true);
-          }
-        }
-        if (typeof navigator !== 'undefined' && !navigator.onLine) {
-          setSyncStatus('offline');
-        }
-      } else {
-        await runSync(saved);
+    const pushLocalMirrorIfReady = async (lastCloudIso?: string) => {
+      if (
+        !localServerActiveRef.current ||
+        activeViewRef.current !== 'pro' ||
+        !canPushServerSync(currentProUserRef.current)
+      ) {
+        return;
       }
-    } else if (
-      isSupabaseEnvConfigured() &&
-      localServerActiveRef.current &&
-      activeViewRef.current === 'pro' &&
-      canPushServerSync(currentProUserRef.current) &&
-      Boolean(getLocalAuthToken())
-    ) {
+      if (!getLocalAuthToken()) {
+        await restoreLocalServerSession().catch(() => null);
+      }
+      if (!getLocalAuthToken()) {
+        if (!lastCloudIso) {
+          setLocalAuthRequired(true);
+        }
+        return;
+      }
       const localRes = await syncWithServer(saved, true, {
-        lastCloudSyncAt: now,
+        ...(lastCloudIso ? { lastCloudSyncAt: lastCloudIso } : {}),
         pushOnlyToLocal: true,
+        actor: currentProUserRef.current,
       });
       if (localRes.localAuthRequired) {
         setLocalAuthRequired(true);
       }
+    };
+
+    if (!skipOutbox) {
+      const actor = currentProUserRef.current;
+      const outbox = await enqueueOutboxMutation(
+        actionLabel,
+        entityBaseUpdatedAt || baseUpdatedAtRef.current,
+        outboxDetails,
+        actor
+          ? {
+              userId: actor.id,
+              role: actor.role,
+              restaurantId: actor.assignedRestaurantId ?? null,
+            }
+          : null
+      );
+      setPendingCount(outbox.length);
+      if (isSupabaseEnvConfigured()) {
+        await pushLocalMirrorIfReady();
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          setSyncStatus('offline');
+          setAutoRetryAt(null);
+        } else {
+          setRetryStoppedPermanent(false);
+          setAutoRetryAt(new Date(Date.now() + 8_000).toISOString());
+        }
+      } else {
+        await runSync(saved);
+      }
+    } else if (isSupabaseEnvConfigured()) {
+      await pushLocalMirrorIfReady(now);
     }
   };
 
@@ -727,24 +1019,62 @@ function SmartMenuShell() {
         baseUpdatedAt,
       };
       setConflictServerState(null);
+      setConflictDetails([]);
+      setRetryStoppedPermanent(false);
+      setAutoRetryAt(null);
       await runSync(currentSnapshot, true);
       showToast(t.sync.statusOnline);
     } else if (conflictServerState) {
+      const existingOutbox = await loadOutbox();
+      const conflictIds = new Set(conflictDetails.map((c) => c.mutationId));
+      const remainingOutbox =
+        conflictIds.size > 0
+          ? existingOutbox.filter((m) => !conflictIds.has(m.id))
+          : existingOutbox.filter(
+              (m) => !canActorReplayMutation(currentProUserRef.current, m, conflictServerState)
+            );
+      const remainingAuthorized = remainingOutbox.filter((m) =>
+        canActorReplayMutation(currentProUserRef.current, m, conflictServerState)
+      );
+
+      const mergedServerWithNonConflicting = buildNonConflictingServerMerge(
+        conflictServerState,
+        remainingAuthorized
+      );
+
       const committed = await savePlatformState({
-        ...conflictServerState,
+        ...mergedServerWithNonConflicting,
+        users: [],
         baseUpdatedAt: conflictServerState.updatedAt,
       });
-      await clearOutbox();
+
+      if (remainingOutbox.length === 0) {
+        await clearOutbox();
+      } else {
+        await replaceOutbox(remainingOutbox);
+      }
       setRestaurants(committed.restaurants);
       setCategories(committed.categories);
       setMenuItems(committed.menuItems);
-      setUsers(committed.users);
+      setUsers(conflictServerState.users ?? []);
       setUpdatedAt(committed.updatedAt);
       setBaseUpdatedAt(committed.updatedAt);
-      setPendingCount(0);
+      baseUpdatedAtRef.current = committed.updatedAt;
+      setPendingCount(remainingOutbox.length);
       setConflictServerState(null);
-      setSyncStatus('online');
-      showToast(t.sync.statusOnline);
+      setConflictDetails([]);
+      setRetryStoppedPermanent(false);
+      setAutoRetryAt(null);
+
+      if (remainingAuthorized.length > 0) {
+        await runSync({
+          ...committed,
+          users: conflictServerState.users ?? [],
+        });
+      } else {
+        setSyncStatus('online');
+        showToast(t.sync.statusOnline);
+      }
     }
   };
 
@@ -909,9 +1239,11 @@ function SmartMenuShell() {
       throw err;
     }
 
+    const existingRest = restaurants.find((r) => r.id === updated.id);
     const next = restaurants.map((r) => (r.id === updated.id ? updated : r));
     if (isSupabaseEnvConfigured()) {
-      if (typeof navigator === 'undefined' || navigator.onLine) {
+      const hasLocalAsset = Boolean(updated.logoUrl?.startsWith('/local-uploads/'));
+      if ((typeof navigator === 'undefined' || navigator.onLine) && !hasLocalAsset) {
         try {
           const sb = await loadSupabaseData();
           const saved = await sb.upsertRestaurantInSupabase(updated, false);
@@ -923,14 +1255,27 @@ function SmartMenuShell() {
           // Fall back to local persistence + outbox queue so edits are never lost
         }
       }
-      await persistLocal('update_restaurant', next, categories, menuItems, users, false, {
-        entityType: 'restaurant',
-        entityId: updated.id,
-        operation: 'upsert',
-        isNew: false,
-        payload: updated,
-      });
-      showToast(t.toast.savedOfflinePending);
+      await persistLocal(
+        'update_restaurant',
+        next,
+        categories,
+        menuItems,
+        users,
+        false,
+        {
+          entityType: 'restaurant',
+          entityId: updated.id,
+          operation: 'upsert',
+          isNew: false,
+          payload: updated,
+        },
+        existingRest?.updatedAt ?? baseUpdatedAtRef.current
+      );
+      if (typeof navigator !== 'undefined' && navigator.onLine && hasLocalAsset) {
+        await refreshFromSupabase(true);
+      } else {
+        showToast(t.toast.savedOfflinePending);
+      }
       return;
     }
 
@@ -951,25 +1296,41 @@ function SmartMenuShell() {
     const target = restaurants.find((r) => r.id === restaurantId);
     if (!target) return;
     const nextStatus = !target.isActive;
-
-    if (isSupabaseEnvConfigured()) {
-      try {
-        const sb = await loadSupabaseData();
-        await sb.toggleRestaurantStatusInSupabase(restaurantId, nextStatus);
-        sb.invalidateSupabaseCatalogCache();
-        const next = restaurants.map((r) =>
-          r.id === restaurantId ? { ...r, isActive: nextStatus } : r
-        );
-        await persistLocal('toggle_restaurant_status', next, categories, menuItems, users, true);
-      } catch {
-        showToast(t.toast.supabaseError, 'error');
-      }
-      return;
-    }
-
     const next = restaurants.map((r) =>
       r.id === restaurantId ? { ...r, isActive: nextStatus } : r
     );
+
+    if (isSupabaseEnvConfigured()) {
+      if (typeof navigator === 'undefined' || navigator.onLine) {
+        try {
+          const sb = await loadSupabaseData();
+          await sb.toggleRestaurantStatusInSupabase(restaurantId, nextStatus);
+          sb.invalidateSupabaseCatalogCache();
+          await persistLocal('toggle_restaurant_status', next, categories, menuItems, users, true);
+          return;
+        } catch {
+          // Queue offline toggle below instead of discarding change
+        }
+      }
+      await persistLocal(
+        'toggle_restaurant_status',
+        next,
+        categories,
+        menuItems,
+        users,
+        false,
+        {
+          entityType: 'restaurant',
+          entityId: restaurantId,
+          operation: 'toggle_status',
+          payload: { isActive: nextStatus },
+        },
+        target.updatedAt ?? baseUpdatedAtRef.current
+      );
+      showToast(t.toast.savedOfflinePending);
+      return;
+    }
+
     await persistLocal('toggle_restaurant_status', next, categories, menuItems, users);
   };
 
@@ -1365,6 +1726,7 @@ function SmartMenuShell() {
       throw err;
     }
 
+    const existingItem = !isNew ? menuItems.find((m) => m.id === item.id) : undefined;
     const nextItems = isNew
       ? [item, ...menuItems]
       : menuItems.map((m) => (m.id === item.id ? item : m));
@@ -1407,7 +1769,8 @@ function SmartMenuShell() {
           operation: 'upsert',
           isNew,
           payload: item,
-        }
+        },
+        existingItem?.updatedAt ?? baseUpdatedAtRef.current
       );
       if (typeof navigator !== 'undefined' && navigator.onLine && hasInlineOrLocalAsset) {
         await refreshFromSupabase(true);
@@ -1447,11 +1810,20 @@ function SmartMenuShell() {
           // Queue offline delete below
         }
       }
-      await persistLocal('delete_item', restaurants, categories, nextItems, users, false, {
-        entityType: 'menu_item',
-        entityId: itemId,
-        operation: 'delete',
-      });
+      await persistLocal(
+        'delete_item',
+        restaurants,
+        categories,
+        nextItems,
+        users,
+        false,
+        {
+          entityType: 'menu_item',
+          entityId: itemId,
+          operation: 'delete',
+        },
+        target?.updatedAt ?? baseUpdatedAtRef.current
+      );
       showToast(t.toast.savedOfflinePending);
       return;
     }
@@ -1489,12 +1861,21 @@ function SmartMenuShell() {
           // Queue offline availability toggle below
         }
       }
-      await persistLocal('toggle_availability', restaurants, categories, nextItems, users, false, {
-        entityType: 'menu_item',
-        entityId: itemId,
-        operation: 'toggle_availability',
-        payload: { isAvailable: nextAvail },
-      });
+      await persistLocal(
+        'toggle_availability',
+        restaurants,
+        categories,
+        nextItems,
+        users,
+        false,
+        {
+          entityType: 'menu_item',
+          entityId: itemId,
+          operation: 'toggle_availability',
+          payload: { isAvailable: nextAvail },
+        },
+        target.updatedAt ?? baseUpdatedAtRef.current
+      );
       showToast(t.toast.savedOfflinePending);
       return;
     }
@@ -1796,20 +2177,31 @@ function SmartMenuShell() {
             }}
             onRefreshCloud={() => refreshFromSupabase(true)}
             onAuthSessionChanged={async (user) => {
+              currentProUserRef.current = user;
+              setCurrentProUser(user);
+              if (!user) {
+                setUsers([]);
+              }
               if (isSupabaseEnvConfigured()) {
                 await refreshFromSupabase(true);
               } else if (localServerActiveRef.current) {
                 if (user?.role === 'super_admin') {
                   const localUsers = await listLocalServerUsers();
                   setUsers(localUsers);
-                } else if (!user) {
+                } else {
                   setUsers([]);
                 }
               }
             }}
             localServerActive={localServerActive}
             localAuthRequired={localAuthRequired}
-            onAuthUserChange={setCurrentProUser}
+            onAuthUserChange={(user) => {
+              currentProUserRef.current = user;
+              setCurrentProUser(user);
+              if (!user) {
+                setUsers([]);
+              }
+            }}
             onLocalAuthSuccess={async () => {
               setLocalAuthRequired(false);
               const outbox = await loadOutbox();
@@ -1833,7 +2225,7 @@ function SmartMenuShell() {
                     baseUpdatedAt,
                   },
                   true,
-                  { pushOnlyToLocal: true }
+                  { pushOnlyToLocal: true, actor: currentProUserRef.current }
                 );
               }
             }}
@@ -1892,17 +2284,21 @@ function SmartMenuShell() {
         pendingCount={pendingCount}
         localServerActive={localServerActive}
         allowLocalOverwrite={activeView === 'pro' && canPushServerSync(currentProUser)}
+        autoRetrying={Boolean(autoRetryAt && !retryStoppedPermanent && syncStatus !== 'offline')}
+        conflictItems={conflictDetails}
         lastSyncedAt={lastSyncedAt}
-        onSyncNow={() =>
-          runSync({
+        onSyncNow={() => {
+          setRetryStoppedPermanent(false);
+          setAutoRetryAt(null);
+          void runSync({
             restaurants,
             categories,
             menuItems,
             users,
             updatedAt,
             baseUpdatedAt,
-          })
-        }
+          });
+        }}
         onResolveConflict={handleResolveConflict}
       />
       <ToastContainer />

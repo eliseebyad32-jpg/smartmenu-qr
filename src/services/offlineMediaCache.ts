@@ -58,16 +58,16 @@ export function getLastConsultedRestaurant(): ConsultedMenuMeta | null {
   }
 }
 
-async function cacheImageUrlIfMissing(url: string): Promise<void> {
+async function cacheImageUrlIfMissing(url: string): Promise<boolean> {
   if (!url || url.startsWith('data:') || typeof window === 'undefined' || !('caches' in window)) {
-    return;
+    return true;
   }
 
   try {
     const cacheName = getTargetCacheName(url);
     const cache = await window.caches.open(cacheName);
     const existing = await cache.match(url);
-    if (existing) return;
+    if (existing) return true;
 
     const isCrossOrigin = url.startsWith('http') && !url.startsWith(window.location.origin);
     const response = await fetch(url, {
@@ -76,9 +76,12 @@ async function cacheImageUrlIfMissing(url: string): Promise<void> {
     });
     if (response.ok || response.type === 'opaque') {
       await cache.put(url, response.clone());
+      return true;
     }
+    return false;
   } catch {
     // Never interrupt rendering on optional offline media prefetch failure
+    return false;
   }
 }
 
@@ -126,16 +129,21 @@ export function scheduleRestaurantMediaCaching(
 
   const queue = [...urls];
   const runQueue = async () => {
+    let hasFailure = false;
     const concurrency = 2;
     const workers = Array.from({ length: concurrency }, async () => {
       while (queue.length > 0 && navigator.onLine) {
         const nextUrl = queue.shift();
         if (nextUrl) {
-          await cacheImageUrlIfMissing(nextUrl);
+          const ok = await cacheImageUrlIfMissing(nextUrl);
+          if (!ok) hasFailure = true;
         }
       }
     });
     await Promise.all(workers);
+    if (hasFailure || queue.length > 0) {
+      activePrefetches.delete(signature);
+    }
   };
 
   const idle = (window as Window & {

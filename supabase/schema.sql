@@ -113,6 +113,17 @@ create table if not exists public.app_sessions (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.app_refresh_tokens (
+  id uuid primary key default gen_random_uuid(),
+  family_id uuid not null,
+  token_hash text unique not null,
+  profile_id uuid not null references public.profiles(id) on delete cascade,
+  expires_at timestamptz not null default (now() + interval '7 days'),
+  used_at timestamptz,
+  revoked_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists public.auth_attempts (
   attempt_key text primary key,
   fail_count int not null default 0,
@@ -135,6 +146,27 @@ create unique index if not exists idx_profiles_username_lower
   where username is not null and trim(username) <> '';
 create index if not exists idx_app_sessions_profile_id on public.app_sessions(profile_id);
 create index if not exists idx_app_sessions_expires_at on public.app_sessions(expires_at);
+create index if not exists idx_app_refresh_tokens_family_id on public.app_refresh_tokens(family_id);
+create index if not exists idx_app_refresh_tokens_profile_id on public.app_refresh_tokens(profile_id);
+create index if not exists idx_app_refresh_tokens_expires_at on public.app_refresh_tokens(expires_at);
+
+create or replace function public.is_safe_media_url(p_url text)
+returns boolean
+language sql
+immutable
+as $$
+  select
+    coalesce(trim(p_url), '') = ''
+    or (
+      length(p_url) <= 350000
+      and (
+        p_url ~ '^/[a-zA-Z0-9._~!$&''()*+,;=:@/?%-]+$'
+        or p_url ~* '^https://[^\s]+$'
+        or p_url ~* '^http://(localhost|127\.0\.0\.1)(:\d+)?(/[^\s]*)?$'
+        or p_url ~* '^data:image/(jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=]+$'
+      )
+    );
+$$;
 
 -- AUTOMATIC UPDATED_AT TRIGGER
 create or replace function public.set_updated_at()
@@ -338,6 +370,8 @@ declare
   v_email text;
   v_profile public.profiles;
   v_token text;
+  v_refresh_token text;
+  v_refresh_expires timestamptz;
 begin
   -- Serialize first-run setup so only the very first request can claim Super Admin
   perform pg_advisory_xact_lock(948271);
@@ -385,9 +419,21 @@ begin
   insert into public.app_sessions (token_hash, profile_id, expires_at)
   values (encode(digest(v_token, 'sha256'), 'hex'), v_profile.id, now() + interval '12 hours');
 
+  v_refresh_token := encode(gen_random_bytes(32), 'hex');
+  v_refresh_expires := now() + interval '7 days';
+  insert into public.app_refresh_tokens (family_id, token_hash, profile_id, expires_at)
+  values (
+    gen_random_uuid(),
+    encode(digest(v_refresh_token, 'sha256'), 'hex'),
+    v_profile.id,
+    v_refresh_expires
+  );
+
   return jsonb_build_object(
     'ok', true,
     'token', v_token,
+    'refresh_token', v_refresh_token,
+    'refresh_expires_at', v_refresh_expires,
     'user', public.serialize_profile(v_profile)
   );
 end;
@@ -410,6 +456,8 @@ declare
   v_profile public.profiles;
   v_hash text;
   v_token text;
+  v_refresh_token text;
+  v_refresh_expires timestamptz;
 begin
   v_key := lower(trim(coalesce(p_identifier, '')));
   if v_key = '' or coalesce(p_password, '') = '' then
@@ -474,14 +522,117 @@ begin
 
   delete from public.auth_attempts where attempt_key = v_key;
   delete from public.app_sessions where expires_at <= now();
+  delete from public.app_refresh_tokens where expires_at <= now();
 
   v_token := encode(gen_random_bytes(32), 'hex');
   insert into public.app_sessions (token_hash, profile_id, expires_at)
   values (encode(digest(v_token, 'sha256'), 'hex'), v_profile.id, now() + interval '12 hours');
 
+  v_refresh_token := encode(gen_random_bytes(32), 'hex');
+  v_refresh_expires := now() + interval '7 days';
+  insert into public.app_refresh_tokens (family_id, token_hash, profile_id, expires_at)
+  values (
+    gen_random_uuid(),
+    encode(digest(v_refresh_token, 'sha256'), 'hex'),
+    v_profile.id,
+    v_refresh_expires
+  );
+
   return jsonb_build_object(
     'ok', true,
     'token', v_token,
+    'refresh_token', v_refresh_token,
+    'refresh_expires_at', v_refresh_expires,
+    'user', public.serialize_profile(v_profile)
+  );
+end;
+$$;
+
+create or replace function public.refresh_app_session(p_refresh_token text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_clean_token text;
+  v_hash text;
+  v_rt public.app_refresh_tokens;
+  v_profile public.profiles;
+  v_new_access text;
+  v_new_refresh text;
+  v_refresh_expires timestamptz;
+begin
+  v_clean_token := nullif(trim(coalesce(p_refresh_token, '')), '');
+  if v_clean_token is null then
+    return jsonb_build_object('ok', false, 'reason', 'invalid_refresh_token');
+  end if;
+
+  v_hash := encode(digest(v_clean_token, 'sha256'), 'hex');
+
+  select *
+    into v_rt
+  from public.app_refresh_tokens
+  where token_hash = v_hash
+  for update;
+
+  if not found then
+    return jsonb_build_object('ok', false, 'reason', 'invalid_refresh_token');
+  end if;
+
+  -- Reuse detection: if an already rotated token is replayed, revoke the entire token family
+  if v_rt.used_at is not null or v_rt.revoked_at is not null then
+    update public.app_refresh_tokens
+    set revoked_at = now()
+    where family_id = v_rt.family_id
+      and revoked_at is null;
+    return jsonb_build_object('ok', false, 'reason', 'revoked');
+  end if;
+
+  if v_rt.expires_at <= now() then
+    return jsonb_build_object('ok', false, 'reason', 'expired');
+  end if;
+
+  select *
+    into v_profile
+  from public.profiles
+  where id = v_rt.profile_id
+    and is_active = true;
+
+  if not found then
+    update public.app_refresh_tokens
+    set revoked_at = now()
+    where family_id = v_rt.family_id
+      and revoked_at is null;
+    return jsonb_build_object('ok', false, 'reason', 'inactive');
+  end if;
+
+  update public.app_refresh_tokens
+  set used_at = now()
+  where id = v_rt.id;
+
+  delete from public.app_sessions where expires_at <= now();
+  delete from public.app_refresh_tokens where expires_at <= now();
+
+  v_new_access := encode(gen_random_bytes(32), 'hex');
+  insert into public.app_sessions (token_hash, profile_id, expires_at)
+  values (encode(digest(v_new_access, 'sha256'), 'hex'), v_profile.id, now() + interval '12 hours');
+
+  v_new_refresh := encode(gen_random_bytes(32), 'hex');
+  v_refresh_expires := now() + interval '7 days';
+  insert into public.app_refresh_tokens (family_id, token_hash, profile_id, expires_at)
+  values (
+    v_rt.family_id,
+    encode(digest(v_new_refresh, 'sha256'), 'hex'),
+    v_profile.id,
+    v_refresh_expires
+  );
+
+  return jsonb_build_object(
+    'ok', true,
+    'token', v_new_access,
+    'refresh_token', v_new_refresh,
+    'refresh_expires_at', v_refresh_expires,
     'user', public.serialize_profile(v_profile)
   );
 end;
@@ -510,7 +661,11 @@ begin
 end;
 $$;
 
-create or replace function public.logout_session(p_session_token text)
+drop function if exists public.logout_session(text);
+create or replace function public.logout_session(
+  p_session_token text,
+  p_refresh_token text default null
+)
 returns void
 language plpgsql
 security definer
@@ -518,12 +673,28 @@ set search_path = public, extensions
 as $$
 declare
   v_token text;
+  v_refresh text;
+  v_family uuid;
 begin
   v_token := nullif(trim(coalesce(p_session_token, '')), '');
-  if v_token is null then
-    return;
+  if v_token is not null then
+    delete from public.app_sessions where token_hash = encode(digest(v_token, 'sha256'), 'hex');
   end if;
-  delete from public.app_sessions where token_hash = encode(digest(v_token, 'sha256'), 'hex');
+
+  v_refresh := nullif(trim(coalesce(p_refresh_token, '')), '');
+  if v_refresh is not null then
+    select family_id into v_family
+    from public.app_refresh_tokens
+    where token_hash = encode(digest(v_refresh, 'sha256'), 'hex')
+    limit 1;
+
+    if v_family is not null then
+      update public.app_refresh_tokens
+      set revoked_at = now()
+      where family_id = v_family
+        and revoked_at is null;
+    end if;
+  end if;
 end;
 $$;
 
@@ -778,6 +949,10 @@ begin
         updated_at = now();
 
   delete from public.app_sessions where profile_id = p_user_id;
+  update public.app_refresh_tokens
+  set revoked_at = now()
+  where profile_id = p_user_id
+    and revoked_at is null;
 end;
 $$;
 
@@ -805,6 +980,10 @@ begin
   update public.profiles set is_active = p_is_active, updated_at = now() where id = p_user_id;
   if not p_is_active then
     delete from public.app_sessions where profile_id = p_user_id;
+    update public.app_refresh_tokens
+    set revoked_at = now()
+    where profile_id = p_user_id
+      and revoked_at is null;
   end if;
 end;
 $$;
@@ -960,6 +1139,11 @@ begin
     raise exception 'Permission denied: super_admin only';
   end if;
 
+  if not public.is_safe_media_url(coalesce(p_row->>'hero_image', ''))
+     or not public.is_safe_media_url(coalesce(p_row->>'logo_url', '')) then
+    raise exception 'URL média invalide ou trop volumineuse.';
+  end if;
+
   v_raw_owner := trim(coalesce(p_row->>'owner_id', ''));
   if v_raw_owner ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' then
     select id into v_owner_id from public.profiles where id = v_raw_owner::uuid;
@@ -1101,6 +1285,10 @@ begin
     if not public.is_super_admin_actor(p_session_token) then
       raise exception 'Permission denied: cannot move item across restaurants';
     end if;
+  end if;
+
+  if not public.is_safe_media_url(coalesce(p_row->>'image_url', '')) then
+    raise exception 'URL image du plat invalide ou trop volumineuse.';
   end if;
 
   insert into public.menu_items (
@@ -1305,6 +1493,7 @@ alter table public.auth_attempts enable row level security;
 -- LOCK DOWN PRIVATE CREDENTIAL/SESSION TABLES COMPLETELY FROM DIRECT POSTGREST ACCESS
 revoke all on public.app_credentials from public, anon, authenticated;
 revoke all on public.app_sessions from public, anon, authenticated;
+revoke all on public.app_refresh_tokens from public, anon, authenticated;
 revoke all on public.auth_attempts from public, anon, authenticated;
 
 -- EXPLICIT POSTGRESQL PRIVILEGES (REQUIRED FOR ANON & AUTHENTICATED UNDER RLS)
@@ -1317,8 +1506,9 @@ grant execute on function public.owns_restaurant(text) to anon, authenticated;
 grant execute on function public.get_auth_bootstrap_status() to anon, authenticated;
 grant execute on function public.setup_initial_super_admin(text, text, text, text) to anon, authenticated;
 grant execute on function public.login_with_identifier(text, text) to anon, authenticated;
+grant execute on function public.refresh_app_session(text) to anon, authenticated;
 grant execute on function public.get_session_user(text) to anon, authenticated;
-grant execute on function public.logout_session(text) to anon, authenticated;
+grant execute on function public.logout_session(text, text) to anon, authenticated;
 grant execute on function public.update_own_credentials(text, text, text, text, text) to anon, authenticated;
 grant execute on function public.change_own_password(text, text, text) to anon, authenticated;
 grant execute on function public.admin_list_profiles(text) to anon, authenticated;

@@ -1,10 +1,16 @@
 import { Category, MenuItem, PlatformUser, Restaurant } from '../types/menu';
+import {
+  clearRenewableRefreshToken,
+  readRenewableRefreshToken,
+  saveRenewableRefreshToken,
+} from './secureSessionStore';
 import { getSupabaseClient } from './supabaseClient';
 
 export const RESTAURANT_ASSETS_BUCKET = 'restaurant-assets';
 
-// Custom PostgreSQL session token kept strictly in JS memory (never localStorage/sessionStorage)
+// Custom PostgreSQL access token kept strictly in JS memory (never localStorage/sessionStorage)
 let memorySupabaseSessionToken: string | null = null;
+let inFlightSupabaseRestore: Promise<PlatformUser | null> | null = null;
 
 export function getSupabaseAppSessionToken(): string | null {
   return memorySupabaseSessionToken;
@@ -12,6 +18,17 @@ export function getSupabaseAppSessionToken(): string | null {
 
 export function clearSupabaseAppSessionToken(): void {
   memorySupabaseSessionToken = null;
+}
+
+export async function hasSupabaseAuthSession(): Promise<boolean> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return false;
+  try {
+    const { data } = await supabase.auth.getSession();
+    return Boolean(data.session?.access_token);
+  } catch {
+    return false;
+  }
 }
 
 function isRpcMissingError(err: { code?: string; message?: string } | null | undefined): boolean {
@@ -409,12 +426,21 @@ export async function setupSupabaseInitialSuperAdmin(payload: {
     return { ok: false, error: error.message };
   }
 
-  const body = data as { ok?: boolean; token?: string; user?: DbProfileRow } | null;
+  const body = data as {
+    ok?: boolean;
+    token?: string;
+    refresh_token?: string;
+    refresh_expires_at?: string;
+    user?: DbProfileRow;
+  } | null;
   if (!body?.ok || !body.token || !body.user) {
     return { ok: false, error: 'Impossible de créer le compte Super Admin.' };
   }
 
   memorySupabaseSessionToken = body.token;
+  if (body.refresh_token) {
+    await saveRenewableRefreshToken('supabase', body.refresh_token, body.refresh_expires_at);
+  }
   return { ok: true, user: mapProfileToPlatformUser(body.user) };
 }
 
@@ -494,27 +520,98 @@ async function resolveProfileForAuthUser(authUser: {
   return { user: null, reason: 'profile_missing' };
 }
 
-export async function fetchCurrentSupabaseUser(): Promise<PlatformUser | null> {
-  const supabase = getSupabaseClient();
-  if (!supabase) return null;
+export async function restoreSupabaseSession(): Promise<PlatformUser | null> {
+  if (inFlightSupabaseRestore) {
+    return inFlightSupabaseRestore;
+  }
 
-  if (memorySupabaseSessionToken) {
-    const { data, error } = await supabase.rpc('get_session_user', {
-      p_session_token: memorySupabaseSessionToken,
-    });
-    if (!error && data) {
-      return mapProfileToPlatformUser(data as DbProfileRow);
+  inFlightSupabaseRestore = (async () => {
+    const supabase = getSupabaseClient();
+    if (!supabase) return null;
+
+    if (memorySupabaseSessionToken) {
+      const { data, error } = await supabase.rpc('get_session_user', {
+        p_session_token: memorySupabaseSessionToken,
+      });
+      if (!error && data) {
+        return mapProfileToPlatformUser(data as DbProfileRow);
+      }
+      if (!error && !data) {
+        memorySupabaseSessionToken = null;
+      }
     }
-    memorySupabaseSessionToken = null;
-  }
 
-  const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
-  if (sessionErr || !sessionData.session?.user) {
-    return null;
-  }
+    const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+    if (!sessionErr && sessionData.session?.user) {
+      const resolved = await resolveProfileForAuthUser(sessionData.session.user);
+      if (resolved.user) {
+        return resolved.user;
+      }
+    }
 
-  const resolved = await resolveProfileForAuthUser(sessionData.session.user);
-  return resolved.user;
+    const storedRefresh = await readRenewableRefreshToken('supabase');
+    if (!storedRefresh) {
+      return null;
+    }
+
+    try {
+      const { data: refreshData, error: refreshError } = await supabase.rpc('refresh_app_session', {
+        p_refresh_token: storedRefresh,
+      });
+
+      if (refreshError) {
+        // Keep refresh token on transient offline/network errors; clear only if RPC explicitly rejects
+        if (isRpcMissingError(refreshError)) {
+          await clearRenewableRefreshToken('supabase');
+        }
+        return null;
+      }
+
+      const res = refreshData as {
+        ok?: boolean;
+        token?: string;
+        refresh_token?: string;
+        refresh_expires_at?: string;
+        user?: DbProfileRow;
+        reason?: string;
+      } | null;
+
+      if (res?.ok && res.token && res.user) {
+        memorySupabaseSessionToken = res.token;
+        if (res.refresh_token) {
+          await saveRenewableRefreshToken('supabase', res.refresh_token, res.refresh_expires_at);
+        }
+        const mapped = mapProfileToPlatformUser(res.user);
+        if (!mapped.isActive) {
+          memorySupabaseSessionToken = null;
+          await clearRenewableRefreshToken('supabase');
+          return null;
+        }
+        return mapped;
+      }
+
+      if (
+        res?.reason === 'invalid_refresh_token' ||
+        res?.reason === 'revoked' ||
+        res?.reason === 'expired' ||
+        res?.reason === 'inactive'
+      ) {
+        await clearRenewableRefreshToken('supabase');
+      }
+      return null;
+    } catch {
+      // Preserve stored refresh token if device is temporarily offline
+      return null;
+    }
+  })().finally(() => {
+    inFlightSupabaseRestore = null;
+  });
+
+  return inFlightSupabaseRestore;
+}
+
+export async function fetchCurrentSupabaseUser(): Promise<PlatformUser | null> {
+  return restoreSupabaseSession();
 }
 
 export async function signInWithSupabase(
@@ -536,6 +633,8 @@ export async function signInWithSupabase(
     const res = rpcData as {
       ok?: boolean;
       token?: string;
+      refresh_token?: string;
+      refresh_expires_at?: string;
       user?: DbProfileRow;
       reason?: string;
       retry_after_seconds?: number;
@@ -546,7 +645,11 @@ export async function signInWithSupabase(
       const mapped = mapProfileToPlatformUser(res.user);
       if (!mapped.isActive) {
         memorySupabaseSessionToken = null;
+        await clearRenewableRefreshToken('supabase');
         return { user: null, reason: 'inactive' };
+      }
+      if (res.refresh_token) {
+        await saveRenewableRefreshToken('supabase', res.refresh_token, res.refresh_expires_at);
       }
       return { user: mapped };
     }
@@ -590,12 +693,20 @@ export async function signInWithSupabase(
 export async function signOutSupabase(): Promise<void> {
   const supabase = getSupabaseClient();
   const token = memorySupabaseSessionToken;
+  const refreshToken = await readRenewableRefreshToken('supabase');
   memorySupabaseSessionToken = null;
+  await clearRenewableRefreshToken('supabase');
 
   if (!supabase) return;
-  if (token) {
+  if (token || refreshToken) {
     try {
-      await supabase.rpc('logout_session', { p_session_token: token });
+      const { error } = await supabase.rpc('logout_session', {
+        p_session_token: token ?? '',
+        p_refresh_token: refreshToken ?? null,
+      });
+      if (error && isRpcMissingError(error) && token) {
+        await supabase.rpc('logout_session', { p_session_token: token });
+      }
     } catch {
       // Ignore logout RPC failure
     }

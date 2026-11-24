@@ -1,13 +1,15 @@
 import React from 'react';
 import { AlertTriangle, Clock, RefreshCw, Server, Wifi, WifiOff } from 'lucide-react';
 import { useLanguage } from '../context/LanguageContext';
-import { SyncStatus } from '../services/syncService';
+import { SyncConflictDetail, SyncStatus } from '../services/syncService';
 
 interface OfflineIndicatorProps {
   syncStatus: SyncStatus;
   pendingCount: number;
   localServerActive?: boolean;
   allowLocalOverwrite?: boolean;
+  autoRetrying?: boolean;
+  conflictItems?: SyncConflictDetail[];
   lastSyncedAt?: string | null;
   onSyncNow: () => void;
   onResolveConflict?: (strategy: 'keep_local' | 'use_server') => void;
@@ -18,6 +20,8 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
   pendingCount,
   localServerActive = false,
   allowLocalOverwrite = false,
+  autoRetrying = false,
+  conflictItems = [],
   lastSyncedAt,
   onSyncNow,
   onResolveConflict,
@@ -25,6 +29,8 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
   const { t, language } = useLanguage();
 
   if (syncStatus === 'conflict' && onResolveConflict) {
+    const visibleConflicts = conflictItems.slice(0, 3);
+    const hiddenCount = Math.max(0, conflictItems.length - visibleConflicts.length);
     return (
       <div
         role="alert"
@@ -32,9 +38,28 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
       >
         <div className="flex items-start gap-2.5">
           <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" aria-hidden="true" />
-          <div>
+          <div className="min-w-0">
             <p className="font-semibold text-white">{t.sync.conflictTitle}</p>
             <p className="text-zinc-300 mt-0.5 leading-relaxed">{t.sync.conflictBody}</p>
+            {visibleConflicts.length > 0 && (
+              <div className="mt-2 rounded-lg bg-zinc-950/80 border border-zinc-800 px-2.5 py-2 space-y-1">
+                <p className="text-[11px] font-medium text-zinc-400">
+                  {t.sync.conflictItemsLabel}
+                </p>
+                <ul className="space-y-0.5 text-[11px] text-amber-300">
+                  {visibleConflicts.map((c) => (
+                    <li key={c.mutationId} className="truncate">
+                      • {c.label}
+                    </li>
+                  ))}
+                  {hiddenCount > 0 && (
+                    <li className="text-zinc-400">
+                      +{hiddenCount} {t.sync.conflictMoreItems}
+                    </li>
+                  )}
+                </ul>
+              </div>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2 pt-1">
@@ -104,7 +129,9 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
       ) : syncStatus === 'error' ? (
         <>
           <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" aria-hidden="true" />
-          <span className="text-red-300 truncate">{t.sync.statusError}</span>
+          <span className="text-red-300 truncate">
+            {autoRetrying ? t.sync.statusAutoRetry : t.sync.statusError}
+          </span>
           {pendingCount > 0 && (
             <span className="font-mono text-[11px] text-zinc-300 tabular-nums shrink-0">
               ({pendingCount})

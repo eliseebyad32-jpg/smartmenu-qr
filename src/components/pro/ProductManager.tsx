@@ -13,10 +13,13 @@ import {
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
 import { isSupabaseConfigured } from '../../services/supabaseClient';
-import { uploadAssetToSupabaseStorage } from '../../services/supabaseData';
+import {
+  hasSupabaseAuthSession,
+  uploadAssetToSupabaseStorage,
+} from '../../services/supabaseData';
 import { uploadAssetToLocalServer } from '../../services/syncService';
 import { Category, MenuItem, Restaurant } from '../../types/menu';
-import { readAndOptimizeImageBlob } from '../../utils/imageUpload';
+import { isSafeRasterDataUrl, readAndOptimizeImageBlob } from '../../utils/imageUpload';
 import { CulinaryImage } from '../CulinaryImage';
 
 interface ProductManagerProps {
@@ -100,23 +103,39 @@ export const ProductManager: React.FC<ProductManagerProps> = ({
   const handlePhotoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !editingItem) return;
+    if (file.type.toLowerCase().includes('svg')) {
+      showToast(t.toast.validationError, 'error');
+      return;
+    }
     setUploadingPhoto(true);
     try {
       const optimized = await readAndOptimizeImageBlob(file, 900);
+      if (!isSafeRasterDataUrl(optimized.dataUrl)) {
+        showToast(t.toast.validationError, 'error');
+        return;
+      }
       if (isSupabaseConfigured() && navigator.onLine) {
-        try {
-          const publicUrl = await uploadAssetToSupabaseStorage(
-            restaurant.id,
-            'dishes',
-            `${editingItem.id}.${optimized.extension}`,
-            optimized.blob,
-            optimized.contentType
-          );
-          setEditingItem({ ...editingItem, image: publicUrl });
+        const hasJwt = await hasSupabaseAuthSession();
+        if (hasJwt) {
+          try {
+            const publicUrl = await uploadAssetToSupabaseStorage(
+              restaurant.id,
+              'dishes',
+              `${editingItem.id}.${optimized.extension}`,
+              optimized.blob,
+              optimized.contentType
+            );
+            setEditingItem({ ...editingItem, image: publicUrl });
+            showToast(t.toast.uploadSuccess);
+            return;
+          } catch {
+            // Fall through to safe bounded inline image
+          }
+        } else {
+          // Simple-username sessions sync bounded raster images directly via RBAC-protected RPC
+          setEditingItem({ ...editingItem, image: optimized.dataUrl });
           showToast(t.toast.uploadSuccess);
           return;
-        } catch {
-          // Fall through to local PC server or inline dataUrl
         }
       }
       const localUrl = await uploadAssetToLocalServer(

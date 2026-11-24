@@ -42,6 +42,7 @@ export const ProAuthGate: React.FC<ProAuthGateProps> = ({
 
   const [checkingBootstrap, setCheckingBootstrap] = useState(true);
   const [needsSuperAdminSetup, setNeedsSuperAdminSetup] = useState(false);
+  const [localSetupRestricted, setLocalSetupRestricted] = useState(false);
   const [schemaPending, setSchemaPending] = useState(false);
 
   const supabaseReady = isSupabaseConfigured();
@@ -57,6 +58,7 @@ export const ProAuthGate: React.FC<ProAuthGateProps> = ({
           const status = await fetchSupabaseBootstrapStatus();
           if (mounted) {
             setNeedsSuperAdminSetup(status.rpcReady && !status.hasSuperAdmin);
+            setLocalSetupRestricted(false);
             setSchemaPending(!status.rpcReady);
           }
           return;
@@ -65,11 +67,13 @@ export const ProAuthGate: React.FC<ProAuthGateProps> = ({
           const status = await fetchLocalServerAuthStatus();
           if (mounted && status) {
             setNeedsSuperAdminSetup(!status.hasSuperAdmin);
+            setLocalSetupRestricted(!status.hasSuperAdmin && status.localhostSetupAllowed === false);
           }
           return;
         }
         if (mounted) {
           setNeedsSuperAdminSetup(false);
+          setLocalSetupRestricted(false);
         }
       } finally {
         if (mounted) setCheckingBootstrap(false);
@@ -228,6 +232,17 @@ export const ProAuthGate: React.FC<ProAuthGateProps> = ({
               <span>{t.auth.noBackendTitle}</span>
             </div>
             <p className="text-xs text-zinc-400 leading-relaxed">{t.auth.noBackendBody}</p>
+          </div>
+        ) : needsSuperAdminSetup && !supabaseReady && localSetupRestricted ? (
+          <div className="rounded-xl bg-orange-950/30 border border-orange-500/40 p-5 space-y-2 text-xs text-orange-200 leading-relaxed">
+            <p className="font-semibold text-orange-300">
+              Configuration initiale réservée au PC serveur (localhost)
+            </p>
+            <p>
+              Pour des raisons de sécurité, la création du compte Super Admin sur le serveur local
+              doit être effectuée directement depuis le PC Windows hôte (via{' '}
+              <span className="font-mono font-semibold">http://localhost:3000</span>).
+            </p>
           </div>
         ) : needsSuperAdminSetup ? (
           <form onSubmit={handleInitialSetupSubmit} className="space-y-4">

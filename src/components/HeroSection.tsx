@@ -58,6 +58,18 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                   height={64}
                   decoding="async"
                   fetchPriority="high"
+                  onError={(e) => {
+                    const img = e.currentTarget;
+                    if (
+                      restaurant.logoUrl?.startsWith('http') &&
+                      !img.dataset.mirrorTried
+                    ) {
+                      img.dataset.mirrorTried = '1';
+                      img.src = `/api/cached-image?url=${encodeURIComponent(restaurant.logoUrl)}`;
+                      return;
+                    }
+                    img.style.display = 'none';
+                  }}
                   className="h-14 w-14 sm:h-16 sm:w-16 rounded-xl object-cover border border-zinc-700 bg-zinc-900 shadow-lg"
                 />
               </div>

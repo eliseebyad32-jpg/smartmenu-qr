@@ -221,7 +221,7 @@ async function fetchSupabaseRest(baseUrl, anonKey, resourceQuery, timeoutMs) {
   }
 }
 
-export async function pullCloudCatalogToLocal({ timeoutMs = 8000, quiet = false } = {}) {
+export async function pullCloudCatalogToLocal({ timeoutMs = 8000, quiet = false, force = false } = {}) {
   ensureDataDirectories();
   const cfg = loadLocalConfig();
 
@@ -230,6 +230,14 @@ export async function pullCloudCatalogToLocal({ timeoutMs = 8000, quiet = false 
       console.log('[SYNC] Supabase non configure (.env manquant) : conservation des donnees locales.');
     }
     return { ok: false, reason: 'supabase_not_configured' };
+  }
+
+  const existing = readJsonSafe(DATA_FILE, null);
+  if (!force && existing?.hasPendingLocalChanges) {
+    if (!quiet) {
+      console.log('[SYNC] Modifications locales en attente : cache local preserve.');
+    }
+    return { ok: false, reason: 'local_changes_pending_preserved' };
   }
 
   try {
@@ -247,7 +255,6 @@ export async function pullCloudCatalogToLocal({ timeoutMs = 8000, quiet = false 
     );
 
     const restaurants = (restRows || []).map(mapDbRestaurant);
-    const existing = readJsonSafe(DATA_FILE, null);
 
     // Never wipe an existing local snapshot if Supabase returns 0 restaurants
     if (restaurants.length === 0 && existing?.restaurants?.length > 0) {
@@ -281,6 +288,7 @@ export async function pullCloudCatalogToLocal({ timeoutMs = 8000, quiet = false 
       updatedAt: existing?.updatedAt && existing.updatedAt > now ? existing.updatedAt : now,
       baseUpdatedAt: now,
       lastCloudSyncAt: now,
+      hasPendingLocalChanges: false,
       serverSavedAt: now,
     };
 

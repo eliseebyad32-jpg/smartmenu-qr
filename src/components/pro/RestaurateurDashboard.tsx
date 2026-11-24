@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Copy, Download, ExternalLink, Printer, QrCode } from 'lucide-react';
+import { Check, Copy, Download, ExternalLink, Printer, QrCode, Wifi } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
+import { fetchLocalServerInfo } from '../../services/syncService';
 import { Category, MenuItem, Restaurant } from '../../types/menu';
 import { ProductManager } from './ProductManager';
 
@@ -51,6 +52,8 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
   const [tab, setTab] = useState<'products' | 'qr'>(() => readStoredDashboardTab());
   const [qrPreview, setQrPreview] = useState('');
   const [copiedLink, setCopiedLink] = useState(false);
+  const [lanBaseUrl, setLanBaseUrl] = useState<string | null>(null);
+  const [preferLanUrl, setPreferLanUrl] = useState(false);
 
   useEffect(() => {
     try {
@@ -60,9 +63,23 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
     }
   }, [tab]);
 
-  const directMenuUrl = `${window.location.origin}/?restaurant=${encodeURIComponent(
-    restaurant.slug
-  )}`;
+  useEffect(() => {
+    let active = true;
+    fetchLocalServerInfo().then((info) => {
+      if (!active || !info.active || !info.primaryLanUrl) return;
+      setLanBaseUrl(info.primaryLanUrl);
+      const host = window.location.hostname;
+      if (host === 'localhost' || host === '127.0.0.1') {
+        setPreferLanUrl(true);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [restaurant.id]);
+
+  const baseOrigin = preferLanUrl && lanBaseUrl ? lanBaseUrl : window.location.origin;
+  const directMenuUrl = `${baseOrigin}/?restaurant=${encodeURIComponent(restaurant.slug)}`;
 
   useEffect(() => {
     let active = true;
@@ -118,6 +135,18 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
             <img
               src={restaurant.logoUrl}
               alt={restaurant.name}
+              onError={(e) => {
+                const img = e.currentTarget;
+                if (
+                  restaurant.logoUrl?.startsWith('http') &&
+                  !img.dataset.mirrorTried
+                ) {
+                  img.dataset.mirrorTried = '1';
+                  img.src = `/api/cached-image?url=${encodeURIComponent(restaurant.logoUrl)}`;
+                  return;
+                }
+                img.style.display = 'none';
+              }}
               className="w-14 h-14 rounded-xl object-cover border border-zinc-700"
             />
           ) : (
@@ -212,6 +241,18 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
           <div className="md:col-span-7 space-y-4">
             <h3 className="font-display text-3xl font-bold text-white">{t.qr.title}</h3>
             <p className="text-sm text-zinc-400 leading-relaxed">{t.qr.subtitle}</p>
+            {lanBaseUrl && (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setPreferLanUrl((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-orange-400 hover:underline cursor-pointer"
+                >
+                  <Wifi className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>{preferLanUrl ? t.qr.useCurrentUrl : t.qr.useLanUrl}</span>
+                </button>
+              </div>
+            )}
             <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-3.5 py-2.5 font-mono text-xs text-zinc-300 break-all">
               {directMenuUrl}
             </div>

@@ -219,12 +219,17 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
   }, [adminMode]);
 
   useEffect(() => {
+    let mounted = true;
+    const failSafeTimer = window.setTimeout(() => {
+      if (mounted) setCheckingSession(false);
+    }, 6000);
+
     if (!supabaseReady) {
       if (!localServerActive) {
+        window.clearTimeout(failSafeTimer);
         setCheckingSession(false);
         return;
       }
-      let mounted = true;
       fetchLocalServerCurrentUser()
         .then((user) => {
           if (!mounted) return;
@@ -233,15 +238,19 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
             onSelectRestaurant(user.assignedRestaurantId);
           }
         })
+        .catch(() => {
+          // Local server unreachable; render auth gate cleanly
+        })
         .finally(() => {
+          window.clearTimeout(failSafeTimer);
           if (mounted) setCheckingSession(false);
         });
       return () => {
         mounted = false;
+        window.clearTimeout(failSafeTimer);
       };
     }
 
-    let mounted = true;
     fetchCurrentSupabaseUser()
       .then((user) => {
         if (!mounted) return;
@@ -250,7 +259,11 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
           onSelectRestaurant(user.assignedRestaurantId);
         }
       })
+      .catch(() => {
+        // Offline or Supabase unreachable
+      })
       .finally(() => {
+        window.clearTimeout(failSafeTimer);
         if (mounted) setCheckingSession(false);
       });
 
@@ -279,6 +292,7 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
 
     return () => {
       mounted = false;
+      window.clearTimeout(failSafeTimer);
       authSub.subscription?.unsubscribe();
     };
   }, [supabaseReady, localServerActive]);

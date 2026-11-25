@@ -341,7 +341,7 @@ Section "SmartMenu QR" SecMain
   ${If} $OptFirewall == "1"
     DetailPrint "Configuration du Pare-feu Windows (port TCP $OptPort)..."
     nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="SMARTMENU QR Local Server"'
-    nsExec::ExecToLog 'netsh advfirewall firewall add rule name="SMARTMENU QR Local Server" dir=in action=allow protocol=TCP localport=$OptPort'
+    nsExec::ExecToLog 'netsh advfirewall firewall add rule name="SMARTMENU QR Local Server" dir=in action=allow protocol=TCP localport=$OptPort profile=any'
   ${EndIf}
 
   DetailPrint "Pré-synchronisation du catalogue local (/api/catalog)..."

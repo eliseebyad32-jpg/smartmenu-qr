@@ -72,6 +72,13 @@ export function readJsonSafe(filePath, fallback) {
 
 export function loadLocalConfig() {
   const fileConfig = readJsonSafe(CONFIG_FILE, {});
+  const rawSec = String(process.env.WIFI_SECURITY ?? fileConfig.wifiSecurity ?? 'WPA').trim();
+  const wifiSecurity = rawSec === 'WEP' || rawSec === 'nopass' ? rawSec : 'WPA';
+  const captiveEnv = process.env.CAPTIVE_PORTAL_ENABLED;
+  const captivePortalEnabled =
+    captiveEnv !== undefined
+      ? captiveEnv !== 'false' && captiveEnv !== '0'
+      : fileConfig.captivePortalEnabled !== false;
   return {
     port: Number(process.env.LOCAL_PORT || fileConfig.port || 3000),
     restaurantId: String(process.env.RESTAURANT_ID ?? fileConfig.restaurantId ?? '').trim(),
@@ -79,6 +86,13 @@ export function loadLocalConfig() {
     publicLanUrl: String(process.env.PUBLIC_LAN_URL ?? fileConfig.publicLanUrl ?? '')
       .trim()
       .replace(/\/+$/, ''),
+    onlineBaseUrl: String(process.env.ONLINE_BASE_URL ?? fileConfig.onlineBaseUrl ?? '')
+      .trim()
+      .replace(/\/+$/, ''),
+    wifiSsid: String(process.env.WIFI_SSID ?? fileConfig.wifiSsid ?? '').trim(),
+    wifiPassword: String(process.env.WIFI_PASSWORD ?? fileConfig.wifiPassword ?? ''),
+    wifiSecurity,
+    captivePortalEnabled,
     supabaseUrl: String(process.env.VITE_SUPABASE_URL || fileConfig.supabaseUrl || '')
       .trim()
       .replace(/\/+$/, ''),

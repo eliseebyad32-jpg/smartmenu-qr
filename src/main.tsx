@@ -17,6 +17,21 @@ if (rawSupabaseUrl && typeof document !== 'undefined') {
   }
 }
 
-registerSW({ immediate: true });
+if (
+  typeof window !== 'undefined' &&
+  'serviceWorker' in navigator &&
+  (window.isSecureContext || window.location.hostname === 'localhost')
+) {
+  try {
+    registerSW({
+      immediate: true,
+      onRegisterError() {
+        // Ignore SW registration failure on restricted browsers
+      },
+    });
+  } catch {
+    // Ignore unsupported SW environments
+  }
+}
 
 createRoot(document.getElementById('root')!).render(<App />);

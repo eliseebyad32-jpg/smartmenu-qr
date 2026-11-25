@@ -32,6 +32,31 @@ export function getSupabaseProjectHost(): string | null {
   }
 }
 
+const SUPABASE_FETCH_TIMEOUT_MS = 9000;
+
+function fetchSupabaseWithTimeout(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  if (typeof AbortController === 'undefined') {
+    return fetch(input, { ...init, cache: 'no-store' });
+  }
+  const controller = new AbortController();
+  const externalSignal = init?.signal;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+  }
+  const timer = globalThis.setTimeout(() => controller.abort(), SUPABASE_FETCH_TIMEOUT_MS);
+  return fetch(input, {
+    ...init,
+    cache: 'no-store',
+    signal: controller.signal,
+  }).finally(() => {
+    globalThis.clearTimeout(timer);
+  });
+}
+
 let cachedClient: SupabaseClient | null = null;
 
 export function getSupabaseClient(): SupabaseClient | null {
@@ -43,7 +68,7 @@ export function getSupabaseClient(): SupabaseClient | null {
         autoRefreshToken: true,
       },
       global: {
-        fetch: (input, init) => fetch(input, { ...init, cache: 'no-store' }),
+        fetch: fetchSupabaseWithTimeout,
       },
     });
   }

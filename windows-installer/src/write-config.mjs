@@ -30,6 +30,12 @@ if (cfgFile) {
     restaurantId: slug,
     restaurantSlug: slug,
     publicLanUrl: typeof prev.publicLanUrl === 'string' ? prev.publicLanUrl : '',
+    onlineBaseUrl: typeof prev.onlineBaseUrl === 'string' ? prev.onlineBaseUrl : '',
+    wifiSsid: typeof prev.wifiSsid === 'string' ? prev.wifiSsid : '',
+    wifiPassword: typeof prev.wifiPassword === 'string' ? prev.wifiPassword : '',
+    wifiSecurity:
+      prev.wifiSecurity === 'WEP' || prev.wifiSecurity === 'nopass' ? prev.wifiSecurity : 'WPA',
+    captivePortalEnabled: prev.captivePortalEnabled !== false,
     autoSyncMinutes: typeof prev.autoSyncMinutes === 'number' ? prev.autoSyncMinutes : 5,
   };
 

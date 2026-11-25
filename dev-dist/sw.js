@@ -67,7 +67,7 @@ if (!self.define) {
     });
   };
 }
-define(['./workbox-afac4cd2'], (function (workbox) { 'use strict';
+define(['./workbox-5d155c7a'], (function (workbox) { 'use strict';
 
   self.skipWaiting();
   workbox.clientsClaim();
@@ -78,12 +78,52 @@ define(['./workbox-afac4cd2'], (function (workbox) { 'use strict';
    */
   workbox.precacheAndRoute([{
     "url": "index.html",
-    "revision": "0.pqednovtns8"
-  }], {});
+    "revision": "0.htj0gntjj6g"
+  }], {
+    "ignoreURLParametersMatching": [/^restaurant$/, /^table$/, /^utm_/, /^fbclid$/]
+  });
   workbox.cleanupOutdatedCaches();
   workbox.registerRoute(new workbox.NavigationRoute(workbox.createHandlerBoundToURL("index.html"), {
-    allowlist: [/^\/$/]
+    allowlist: [/^\/$/],
+    denylist: [/^\/api\//, /^\/local-uploads\//, /^\/local-cache\//]
   }));
+  workbox.registerRoute(/\/src\/assets\/images\/.*\.(?:webp|jpg|jpeg|avif|png)$/i, new workbox.CacheFirst({
+    "cacheName": "smartmenu-local-images-v1",
+    plugins: [new workbox.ExpirationPlugin({
+      maxEntries: 250,
+      maxAgeSeconds: 2592000
+    }), new workbox.CacheableResponsePlugin({
+      statuses: [0, 200]
+    })]
+  }), 'GET');
+  workbox.registerRoute(/\/(?:local-uploads|local-cache)\/.*/i, new workbox.CacheFirst({
+    "cacheName": "smartmenu-local-uploads-v1",
+    plugins: [new workbox.ExpirationPlugin({
+      maxEntries: 200,
+      maxAgeSeconds: 2592000
+    }), new workbox.CacheableResponsePlugin({
+      statuses: [0, 200]
+    })]
+  }), 'GET');
+  workbox.registerRoute(/^https:\/\/.*\.supabase\.co\/storage\/v1\/object\/public\/.*/i, new workbox.CacheFirst({
+    "cacheName": "smartmenu-supabase-images-v1",
+    plugins: [new workbox.ExpirationPlugin({
+      maxEntries: 200,
+      maxAgeSeconds: 2592000
+    }), new workbox.CacheableResponsePlugin({
+      statuses: [0, 200]
+    })]
+  }), 'GET');
+  workbox.registerRoute(/^https:\/\/.*\.supabase\.co\/rest\/v1\/.*/i, new workbox.NetworkFirst({
+    "cacheName": "smartmenu-supabase-api-v1",
+    "networkTimeoutSeconds": 4,
+    plugins: [new workbox.ExpirationPlugin({
+      maxEntries: 40,
+      maxAgeSeconds: 604800
+    }), new workbox.CacheableResponsePlugin({
+      statuses: [0, 200]
+    })]
+  }), 'GET');
   workbox.registerRoute(/^https:\/\/fonts\.googleapis\.com\/.*/i, new workbox.CacheFirst({
     "cacheName": "google-fonts-cache",
     plugins: [new workbox.ExpirationPlugin({

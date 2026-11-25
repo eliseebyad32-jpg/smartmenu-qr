@@ -116,6 +116,7 @@ export function scheduleRestaurantMediaCaching(
 
   if (restaurant.heroImage) {
     urls.add(resolvePreferredImageUrl(restaurant.heroImage, 'hero'));
+    urls.add(restaurant.heroImage);
   }
   if (restaurant.logoUrl) {
     urls.add(restaurant.logoUrl);
@@ -125,6 +126,9 @@ export function scheduleRestaurantMediaCaching(
     if (item.restaurantId !== restaurant.id || !item.image) continue;
     urls.add(resolvePreferredImageUrl(item.image, 'thumb'));
     urls.add(resolvePreferredImageUrl(item.image, 'medium'));
+    if (item.image.startsWith('http') || item.image.startsWith('/local-uploads/')) {
+      urls.add(item.image);
+    }
   }
 
   const queue = [...urls];

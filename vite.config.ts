@@ -57,8 +57,14 @@ export default defineConfig(() => {
           clientsClaim: true,
           skipWaiting: true,
           navigateFallback: 'index.html',
-          navigateFallbackDenylist: [/^\/api\//, /^\/local-uploads\//, /^\/local-cache\//],
-          ignoreURLParametersMatching: [/^restaurant$/, /^table$/, /^utm_/, /^fbclid$/],
+          navigateFallbackDenylist: [
+            /^\/api\//,
+            /^\/local-uploads\//,
+            /^\/local-cache\//,
+            /^\/assets\//,
+            /\/[^/?]+\.[a-zA-Z0-9]{1,8}$/,
+          ],
+          ignoreURLParametersMatching: [/^restaurant$/, /^table$/, /^mode$/, /^wifi$/, /^utm_/, /^fbclid$/],
           runtimeCaching: [
             {
               urlPattern: /\/src\/assets\/images\/.*\.(?:webp|jpg|jpeg|avif|png)$/i,
@@ -66,7 +72,7 @@ export default defineConfig(() => {
               options: {
                 cacheName: 'smartmenu-local-images-v1',
                 expiration: {
-                  maxEntries: 250,
+                  maxEntries: 300,
                   maxAgeSeconds: 60 * 60 * 24 * 30,
                 },
                 cacheableResponse: {
@@ -152,20 +158,18 @@ export default defineConfig(() => {
           type: 'module',
         },
       }),
-      // Copies src/assets into dist/ so root-relative URLs like
-      // "/src/assets/images/..." (e.g. generate_image output) still resolve
-      // in production builds. Do not remove.
+      // Copies src/assets into dist/ during writeBundle (before VitePWA closeBundle)
+      // so all *-thumb.webp files are discovered for precaching even on clean builds.
       {
         name: 'copy-unbundled-src-assets',
         apply: 'build',
-        closeBundle(error?: Error): void {
-          if (error) {
-            return;
-          }
-          const distDir = path.resolve(import.meta.dirname, 'dist');
+        writeBundle(outputOptions): void {
+          const outDir = outputOptions.dir
+            ? path.resolve(outputOptions.dir)
+            : path.resolve(import.meta.dirname, 'dist');
           const srcAssets = path.resolve(import.meta.dirname, 'src/assets');
-          const distAssets = path.resolve(distDir, 'src/assets');
-          if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
+          const distAssets = path.resolve(outDir, 'src/assets');
+          if (fs.existsSync(outDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
           }
         },

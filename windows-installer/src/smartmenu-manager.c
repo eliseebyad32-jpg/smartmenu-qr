@@ -69,6 +69,11 @@ typedef struct {
     int port;
     WCHAR restaurantSlug[128];
     WCHAR publicLanUrl[256];
+    WCHAR onlineBaseUrl[256];
+    WCHAR wifiSsid[128];
+    WCHAR wifiPassword[128];
+    WCHAR wifiSecurity[32];
+    BOOL captivePortalEnabled;
     WCHAR supabaseUrl[256];
     WCHAR supabaseAnonKey[512];
 } AppConfig;
@@ -294,6 +299,8 @@ static void LoadAppConfig(void) {
     memset(&g_cfg, 0, sizeof(g_cfg));
     g_cfg.port = 3000;
     wcscpy(g_cfg.restaurantSlug, L"rocomamas-lubumbashi");
+    wcscpy(g_cfg.wifiSecurity, L"WPA");
+    g_cfg.captivePortalEnabled = TRUE;
 
     char *cfgJson = ReadFileUtf8(g_configFile, NULL);
     if (cfgJson) {
@@ -310,6 +317,29 @@ static void LoadAppConfig(void) {
         char lanBuf[256] = {0};
         if (ExtractJsonStringField(cfgJson, "publicLanUrl", lanBuf, sizeof(lanBuf))) {
             Utf8ToWide(lanBuf, g_cfg.publicLanUrl, 256);
+        }
+        char onlineBuf[256] = {0};
+        if (ExtractJsonStringField(cfgJson, "onlineBaseUrl", onlineBuf, sizeof(onlineBuf))) {
+            Utf8ToWide(onlineBuf, g_cfg.onlineBaseUrl, 256);
+        }
+        char ssidBuf[128] = {0};
+        if (ExtractJsonStringField(cfgJson, "wifiSsid", ssidBuf, sizeof(ssidBuf))) {
+            Utf8ToWide(ssidBuf, g_cfg.wifiSsid, 128);
+        }
+        char pwdBuf[128] = {0};
+        if (ExtractJsonStringField(cfgJson, "wifiPassword", pwdBuf, sizeof(pwdBuf))) {
+            Utf8ToWide(pwdBuf, g_cfg.wifiPassword, 128);
+        }
+        char secBuf[32] = {0};
+        if (ExtractJsonStringField(cfgJson, "wifiSecurity", secBuf, sizeof(secBuf)) && secBuf[0]) {
+            Utf8ToWide(secBuf, g_cfg.wifiSecurity, 32);
+        }
+        if (strstr(cfgJson, "\"captivePortalEnabled\"") && strstr(cfgJson, "false")) {
+            const char *capPos = strstr(cfgJson, "\"captivePortalEnabled\"");
+            const char *falsePos = capPos ? strstr(capPos, "false") : NULL;
+            if (falsePos && (falsePos - capPos) < 40) {
+                g_cfg.captivePortalEnabled = FALSE;
+            }
         }
         free(cfgJson);
     }
@@ -329,17 +359,29 @@ static void LoadAppConfig(void) {
 static BOOL SaveAppConfig(const AppConfig *cfg) {
     char slugU8[256], slugEsc[256];
     char lanU8[512], lanEsc[512];
+    char onlineU8[512], onlineEsc[512];
+    char ssidU8[256], ssidEsc[256];
+    char pwdU8[256], pwdEsc[256];
+    char secU8[64], secEsc[64];
     char sbUrlU8[512], sbKeyU8[1024];
 
     WideToUtf8(cfg->restaurantSlug, slugU8, sizeof(slugU8));
     WideToUtf8(cfg->publicLanUrl, lanU8, sizeof(lanU8));
+    WideToUtf8(cfg->onlineBaseUrl, onlineU8, sizeof(onlineU8));
+    WideToUtf8(cfg->wifiSsid, ssidU8, sizeof(ssidU8));
+    WideToUtf8(cfg->wifiPassword, pwdU8, sizeof(pwdU8));
+    WideToUtf8(cfg->wifiSecurity[0] ? cfg->wifiSecurity : L"WPA", secU8, sizeof(secU8));
     WideToUtf8(cfg->supabaseUrl, sbUrlU8, sizeof(sbUrlU8));
     WideToUtf8(cfg->supabaseAnonKey, sbKeyU8, sizeof(sbKeyU8));
 
     JsonEscape(slugU8, slugEsc, sizeof(slugEsc));
     JsonEscape(lanU8, lanEsc, sizeof(lanEsc));
+    JsonEscape(onlineU8, onlineEsc, sizeof(onlineEsc));
+    JsonEscape(ssidU8, ssidEsc, sizeof(ssidEsc));
+    JsonEscape(pwdU8, pwdEsc, sizeof(pwdEsc));
+    JsonEscape(secU8, secEsc, sizeof(secEsc));
 
-    char jsonBuf[2048];
+    char jsonBuf[4096];
     _snprintf(
         jsonBuf,
         sizeof(jsonBuf),
@@ -348,12 +390,22 @@ static BOOL SaveAppConfig(const AppConfig *cfg) {
         "  \"restaurantId\": \"%s\",\n"
         "  \"restaurantSlug\": \"%s\",\n"
         "  \"publicLanUrl\": \"%s\",\n"
+        "  \"onlineBaseUrl\": \"%s\",\n"
+        "  \"wifiSsid\": \"%s\",\n"
+        "  \"wifiPassword\": \"%s\",\n"
+        "  \"wifiSecurity\": \"%s\",\n"
+        "  \"captivePortalEnabled\": %s,\n"
         "  \"autoSyncMinutes\": 5\n"
         "}\n",
         cfg->port,
         slugEsc,
         slugEsc,
-        lanEsc
+        lanEsc,
+        onlineEsc,
+        ssidEsc,
+        pwdEsc,
+        secEsc,
+        cfg->captivePortalEnabled ? "true" : "false"
     );
 
     char envBuf[2048];
@@ -422,6 +474,8 @@ static void InitPaths(void) {
 
 static BOOL IsVirtualAdapterName(const WCHAR *name) {
     if (!name) return FALSE;
+    // Do NOT penalize Windows 11 Mobile Hotspot / Wi-Fi Direct virtual adapter
+    if (StrStrIW(name, L"Wi-Fi Direct") != NULL) return FALSE;
     const WCHAR *bad[] = {
         L"Virtual", L"VMware", L"VirtualBox", L"Hyper-V", L"vEthernet",
         L"WSL", L"Docker", L"Loopback", L"Tailscale", L"Hamachi", L"Bluetooth"
@@ -470,6 +524,10 @@ static void DetectBestLanIp(WCHAR *outIp, int outCap) {
             else if (cur->IfType == IF_TYPE_ETHERNET_CSMACD) score += 20;
 
             if (cur->FriendlyName && StrStrIW(cur->FriendlyName, L"Wi-Fi") != NULL) score += 10;
+            if ((cur->Description && StrStrIW(cur->Description, L"Wi-Fi Direct") != NULL) ||
+                strncmp(ipA, "192.168.137.", 12) == 0) {
+                score += 12;
+            }
             if (IsVirtualAdapterName(cur->Description) || IsVirtualAdapterName(cur->FriendlyName)) score -= 60;
 
             if (strncmp(ipA, "192.168.", 8) == 0) score += 15;

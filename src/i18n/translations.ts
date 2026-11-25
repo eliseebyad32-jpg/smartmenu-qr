@@ -92,18 +92,66 @@ export const UI_TRANSLATIONS = {
         '1. Appuyez sur le bouton Partager dans la barre Safari.\n2. Sélectionnez « Sur l’écran d’accueil ».',
     },
     qr: {
-      title: 'QR Code de table',
-      subtitle: 'Scannez ce code avec un smartphone Android ou iPhone pour ouvrir ce menu sans compte.',
+      title: 'QR Codes de table (En ligne + Wi-Fi local)',
+      subtitle:
+        'Deux QR codes complémentaires : accès Internet direct (QR 1) et connexion au Wi-Fi du restaurant + page locale sans Internet (QR 2).',
       directLink: 'Lien direct du menu',
       copyLink: 'Copier le lien',
       copied: 'Lien copié',
       downloadPng: 'Télécharger en PNG',
-      printCard: 'Imprimer fiche table',
+      printCard: 'Imprimer la fiche double QR',
       tableNumber: 'Numéro de table (optionnel)',
       tableScanPrompt: 'Scannez pour consulter notre menu numérique',
       lanModeBadge: 'Adresse Wi-Fi locale détectée',
       useLanUrl: 'Utiliser l’adresse Wi-Fi locale (sans Internet)',
       useCurrentUrl: 'Utiliser l’URL actuelle',
+      qr1Badge: 'QR 1 · Menu en ligne (Internet)',
+      qr1Title: 'Accès direct au menu en ligne',
+      qr1Subtitle:
+        'Pour les clients utilisant leurs données mobiles (4G/5G) ou une connexion Internet classique.',
+      qr1UrlLabel: 'URL publique en ligne (QR 1)',
+      qr1UrlPlaceholder: 'https://votre-domaine.com',
+      qr1LocalWarning:
+        'Vous êtes actuellement sur une adresse locale : renseignez votre URL HTTPS en ligne pour que QR 1 fonctionne hors du restaurant.',
+      qr2Badge: 'QR 2 · Wi-Fi du restaurant + Portail local',
+      qr2Title: 'Wi-Fi local & Page « CONNECTER ET ACCÉDER AU MENU »',
+      qr2Subtitle:
+        'Étape 1 : le client scanne le QR Wi-Fi pour rejoindre votre réseau. Étape 2 : il ouvre la page d’accueil locale pour accéder au menu même sans Internet.',
+      wifiJoinTab: '1. QR Connexion Wi-Fi',
+      wifiPortalTab: '2. QR Portail Local (/connect)',
+      wifiJoinPrompt: 'Scannez avec l’appareil photo pour rejoindre le Wi-Fi',
+      wifiPortalPrompt: 'Puis scannez pour ouvrir « CONNECTER ET ACCÉDER AU MENU »',
+      wifiSsidLabel: 'Nom du réseau Wi-Fi (SSID)',
+      wifiSsidPlaceholder: 'ex. Restaurant_WiFi_Menu',
+      wifiPasswordLabel: 'Mot de passe Wi-Fi',
+      wifiPasswordPlaceholder: 'Laisser vide si réseau ouvert',
+      wifiSecurityLabel: 'Sécurité Wi-Fi',
+      wifiSecurityWpa: 'WPA / WPA2 / WPA3',
+      wifiSecurityWep: 'WEP',
+      wifiSecurityOpen: 'Ouvert (sans mot de passe)',
+      wifiMissingSsid: 'Saisissez le nom du Wi-Fi (SSID) ci-dessous pour générer le QR Wi-Fi.',
+      captiveRedirectLabel: 'Activer les routes portail captif sur le serveur Windows',
+      saveDualQrConfig: 'Enregistrer la config Wi-Fi & QR',
+      savingConfig: 'Enregistrement...',
+      configSavedServer: 'Configuration Wi-Fi & QR enregistrée sur le serveur PC et le navigateur.',
+      configSavedLocalOnly:
+        'Configuration enregistrée dans ce navigateur. Déverrouillez la session Pro locale pour l’enregistrer sur le PC serveur.',
+      captiveNoteTitle: 'Compatibilité Windows 11 & limite du portail captif',
+      captiveNoteBody:
+        'Un PC Windows 11 seul ne peut pas forcer l’ouverture automatique du mini-navigateur Wi-Fi sur un téléphone sans routeur compatible portail captif (redirection DNS vers l’IP du PC). Utiliser les deux QR codes (Wi-Fi + Portail /connect) garantit l’accès sur tous les téléphones Android et iPhone sans modifier le routeur.',
+    },
+    connect: {
+      badge: 'Wi-Fi Local · Accès Restaurant',
+      headingFallback: 'Menu Numérique Local',
+      subtitle:
+        'Vous êtes connecté au serveur local du restaurant. Appuyez sur le bouton ci-dessous pour charger la carte complète, même sans connexion Internet.',
+      ctaButton: 'CONNECTER ET ACCÉDER AU MENU',
+      checkingServer: 'Connexion au menu local...',
+      serverReady: 'Serveur local prêt — Menu disponible hors ligne',
+      serverChecking: 'Vérification du serveur local...',
+      offlineCacheNote:
+        'Les catégories, plats, prix et photos enregistrés sur ce poste sont prêts à être consultés.',
+      retryLabel: 'Réessayer la connexion locale',
     },
     auth: {
       eyebrow: 'Accès sécurisé multi-rôles',
@@ -359,6 +407,12 @@ export const UI_TRANSLATIONS = {
     },
     offline: {
       banner: 'Mode hors ligne actif — Menu chargé depuis le cache local.',
+      emptyTitle: 'Connexion Internet indisponible',
+      emptyBody:
+        'Aucun menu n’est encore en cache dans ce navigateur et le serveur cloud est injoignable. Connectez-vous au Wi-Fi du restaurant ou rétablissez Internet puis réessayez.',
+      emptyLocalHint:
+        'Si vous utilisez le serveur Windows local, assurez-vous qu’une première synchronisation a été effectuée ou créez le menu depuis l’Espace Pro.',
+      retryNow: 'Réessayer maintenant',
     },
     sync: {
       statusOnline: 'En ligne · Synchronisé',
@@ -481,18 +535,65 @@ export const UI_TRANSLATIONS = {
         '1. Tap the Share button in the Safari toolbar.\n2. Tap "Add to Home Screen".',
     },
     qr: {
-      title: 'Table QR Code',
-      subtitle: 'Scan with any Android or iPhone camera to open this menu with zero sign-up required.',
+      title: 'Table QR Codes (Online + Local Wi-Fi)',
+      subtitle:
+        'Dual QR system: direct online access (QR 1) plus local restaurant Wi-Fi auto-join and offline welcome page (QR 2).',
       directLink: 'Direct menu link',
       copyLink: 'Copy link',
       copied: 'Link copied',
       downloadPng: 'Download PNG',
-      printCard: 'Print table card',
+      printCard: 'Print dual QR card',
       tableNumber: 'Table number (optional)',
       tableScanPrompt: 'Scan to browse our digital menu',
       lanModeBadge: 'Local Wi-Fi server detected',
       useLanUrl: 'Use local Wi-Fi URL (works offline)',
       useCurrentUrl: 'Use current URL',
+      qr1Badge: 'QR 1 · Online Menu (Internet)',
+      qr1Title: 'Direct access to online menu',
+      qr1Subtitle: 'For guests browsing with mobile data (4G/5G) or regular Internet.',
+      qr1UrlLabel: 'Public online URL (QR 1)',
+      qr1UrlPlaceholder: 'https://your-domain.com',
+      qr1LocalWarning:
+        'Currently running on a local address: enter your public HTTPS URL so QR 1 works outside the venue.',
+      qr2Badge: 'QR 2 · Restaurant Wi-Fi + Local Portal',
+      qr2Title: 'Local Wi-Fi & « CONNECT & OPEN MENU » Page',
+      qr2Subtitle:
+        'Step 1: Guest scans the Wi-Fi QR to join automatically. Step 2: Opens the local welcome page to browse the menu offline.',
+      wifiJoinTab: '1. Wi-Fi Auto-Join QR',
+      wifiPortalTab: '2. Local Portal QR (/connect)',
+      wifiJoinPrompt: 'Scan with your camera to join restaurant Wi-Fi',
+      wifiPortalPrompt: 'Then scan to open « CONNECT & OPEN MENU »',
+      wifiSsidLabel: 'Wi-Fi Network Name (SSID)',
+      wifiSsidPlaceholder: 'e.g. Restaurant_WiFi_Menu',
+      wifiPasswordLabel: 'Wi-Fi Password',
+      wifiPasswordPlaceholder: 'Leave empty if open network',
+      wifiSecurityLabel: 'Wi-Fi Security',
+      wifiSecurityWpa: 'WPA / WPA2 / WPA3',
+      wifiSecurityWep: 'WEP',
+      wifiSecurityOpen: 'Open (no password)',
+      wifiMissingSsid: 'Enter the Wi-Fi SSID below to generate the Wi-Fi QR code.',
+      captiveRedirectLabel: 'Enable captive portal probe routes on Windows server',
+      saveDualQrConfig: 'Save Wi-Fi & QR settings',
+      savingConfig: 'Saving...',
+      configSavedServer: 'Wi-Fi & QR settings saved to the Windows server and browser.',
+      configSavedLocalOnly:
+        'Settings saved in this browser. Unlock local Pro session to persist them onto the Windows PC server.',
+      captiveNoteTitle: 'Windows 11 compatibility & captive portal limit',
+      captiveNoteBody:
+        'A Windows 11 PC alone cannot force phones to pop up a captive mini-browser automatically unless the Wi-Fi router performs DNS redirection to the PC IP. Pairing Wi-Fi QR + Local /connect QR works reliably on every Android and iPhone with no router firmware changes.',
+    },
+    connect: {
+      badge: 'Local Wi-Fi · Venue Access',
+      headingFallback: 'Local Digital Menu',
+      subtitle:
+        'You are connected to the restaurant local server. Tap the button below to load the full menu, even without Internet.',
+      ctaButton: 'CONNECTER ET ACCÉDER AU MENU',
+      checkingServer: 'Connecting to local menu...',
+      serverReady: 'Local server ready — Menu available offline',
+      serverChecking: 'Checking local server...',
+      offlineCacheNote:
+        'Synchronized categories, dishes, prices, and photos stored on this station are ready to browse.',
+      retryLabel: 'Retry local connection',
     },
     auth: {
       eyebrow: 'Role-based secure access',
@@ -748,6 +849,12 @@ export const UI_TRANSLATIONS = {
     },
     offline: {
       banner: 'Offline mode active — Menu served from local cache.',
+      emptyTitle: 'Internet connection unavailable',
+      emptyBody:
+        'No menu is cached in this browser yet and the cloud server is unreachable. Connect to the restaurant Wi-Fi or restore Internet, then retry.',
+      emptyLocalHint:
+        'If using the Windows local server, ensure an initial sync completed or create your menu from the Pro Portal.',
+      retryNow: 'Retry now',
     },
     sync: {
       statusOnline: 'Online · Synced',

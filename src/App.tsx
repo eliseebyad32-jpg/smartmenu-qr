@@ -1,6 +1,7 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { Database, ShieldAlert, ShoppingBag } from 'lucide-react';
+import { ComponentType, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { CheckCircle2, Database, RefreshCw, ShieldAlert, ShoppingBag, Wifi } from 'lucide-react';
 import { resolvePreferredImageUrl } from './components/CulinaryImage';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { Footer } from './components/Footer';
 import { HeroSection } from './components/HeroSection';
 import { LocationSection } from './components/LocationSection';
@@ -56,6 +57,7 @@ import {
   fetchLocalServerInfo,
   getLocalAuthToken,
   listLocalServerUsers,
+  LocalServerInfo,
   reassignLocalServerOwner,
   resetLocalServerUserPassword,
   restoreLocalServerSession,
@@ -83,26 +85,49 @@ function loadSupabaseData() {
   return supabaseDataModulePromise;
 }
 
+function lazyWithRetry<T extends ComponentType<any>>(
+  factory: () => Promise<{ default: T }>
+) {
+  return lazy(async () => {
+    try {
+      return await factory();
+    } catch {
+      await new Promise((resolve) => window.setTimeout(resolve, 350));
+      return factory();
+    }
+  });
+}
+
 // Lazy-load secondary drawers and the Pro workspace so customer QR scans load minimally on slow networks
-const ProWorkspace = lazy(() =>
+const ProWorkspace = lazyWithRetry(() =>
   import('./components/ProWorkspace').then((m) => ({ default: m.ProWorkspace }))
 );
-const CartDrawer = lazy(() =>
+const CartDrawer = lazyWithRetry(() =>
   import('./components/CartDrawer').then((m) => ({ default: m.CartDrawer }))
 );
-const DishDetailModal = lazy(() =>
+const DishDetailModal = lazyWithRetry(() =>
   import('./components/DishDetailModal').then((m) => ({ default: m.DishDetailModal }))
 );
-const QRCodeModal = lazy(() =>
+const QRCodeModal = lazyWithRetry(() =>
   import('./components/QRCodeModal').then((m) => ({ default: m.QRCodeModal }))
 );
 
 const ACTIVE_VIEW_KEY = 'smartmenu_qr_active_view_v1';
 const OPEN_QR_STATE_KEY = 'smartmenu_qr_open_qr_v1';
 
+function isConnectWelcomeUrl(): boolean {
+  if (typeof window === 'undefined') return false;
+  const pathname = window.location.pathname.replace(/\/+$/, '');
+  const params = new URLSearchParams(window.location.search);
+  return pathname === '/connect' || pathname === '/welcome' || params.get('mode') === 'connect';
+}
+
 function readStoredActiveView(): AppView {
   if (typeof window === 'undefined') return 'customer';
   try {
+    if (isConnectWelcomeUrl()) {
+      return 'customer';
+    }
     if (window.location.hash.includes('type=recovery')) {
       return 'pro';
     }
@@ -162,6 +187,9 @@ function SmartMenuShell() {
   const [isCloudBootstrapping, setIsCloudBootstrapping] = useState<boolean>(
     supabaseEnabled && !(initialCachedSnapshot && initialCachedSnapshot.restaurants.length > 0)
   );
+  const [cloudEmptyConfirmed, setCloudEmptyConfirmed] = useState<boolean>(false);
+  const [showConnectPortal, setShowConnectPortal] = useState<boolean>(() => isConnectWelcomeUrl());
+  const [connectBusy, setConnectBusy] = useState<boolean>(false);
 
   const [activeRestaurantId, setActiveRestaurantId] = useState<string>(() => {
     const urlSlug = getInitialRestaurantSlug();
@@ -222,6 +250,8 @@ function SmartMenuShell() {
   localServerActiveRef.current = localServerActive;
   const currentProUserRef = useRef<PlatformUser | null>(currentProUser);
   currentProUserRef.current = currentProUser;
+  const updatedAtRef = useRef(updatedAt);
+  updatedAtRef.current = updatedAt;
   const baseUpdatedAtRef = useRef(baseUpdatedAt);
   baseUpdatedAtRef.current = baseUpdatedAt;
   const syncStatusRef = useRef(syncStatus);
@@ -326,7 +356,7 @@ function SmartMenuShell() {
               categories: categoriesRef.current,
               menuItems: menuItemsRef.current,
               users: usersRef.current,
-              updatedAt: new Date().toISOString(),
+              updatedAt: restaurantsRef.current.length > 0 ? updatedAtRef.current : '',
               baseUpdatedAt: baseUpdatedAtRef.current,
             },
             false,
@@ -465,6 +495,7 @@ function SmartMenuShell() {
           }
 
           const cloud = await sb.fetchSupabaseCatalog(force);
+          setCloudEmptyConfirmed(cloud.restaurants.length === 0);
           await applyAndCacheCloudState(
             cloud.restaurants,
             cloud.categories,
@@ -485,7 +516,7 @@ function SmartMenuShell() {
               categories: categoriesRef.current,
               menuItems: menuItemsRef.current,
               users: usersRef.current,
-              updatedAt: new Date().toISOString(),
+              updatedAt: restaurantsRef.current.length > 0 ? updatedAtRef.current : '',
               baseUpdatedAt: baseUpdatedAtRef.current,
             },
             false,
@@ -608,33 +639,70 @@ function SmartMenuShell() {
     let mounted = true;
 
     const init = async () => {
-      const [outbox, serverInfo] = await Promise.all([
+      // 1. Hydrate from IndexedDB IMMEDIATELY in parallel with server-info & outbox (never block offline render on network)
+      const [outbox, cachedState, serverInfo] = await Promise.all([
         loadOutbox().catch(() => []),
-        fetchLocalServerInfo().catch(() => ({ active: false })),
+        loadPlatformState(!isSupabaseEnvConfigured()).catch(() => null),
+        fetchLocalServerInfo().catch((): LocalServerInfo => ({ active: false })),
       ]);
       if (!mounted) return;
       setPendingCount(outbox.length);
       setLocalServerActive(serverInfo.active);
       localServerActiveRef.current = serverInfo.active;
 
+      if (cachedState && cachedState.restaurants.length > 0) {
+        setRestaurants(cachedState.restaurants);
+        setCategories(cachedState.categories);
+        setMenuItems(cachedState.menuItems);
+        setUpdatedAt(cachedState.updatedAt);
+        updatedAtRef.current = cachedState.updatedAt;
+        setBaseUpdatedAt(cachedState.baseUpdatedAt || cachedState.updatedAt);
+        baseUpdatedAtRef.current = cachedState.baseUpdatedAt || cachedState.updatedAt;
+
+        const urlSlug = getInitialRestaurantSlug();
+        const lastConsulted = getLastConsultedRestaurant();
+        if (urlSlug) {
+          const matched = cachedState.restaurants.find((r) => r.slug === urlSlug);
+          if (matched) setActiveRestaurantId(matched.id);
+        } else if (lastConsulted) {
+          const matched = cachedState.restaurants.find((r) => r.slug === lastConsulted.slug);
+          if (matched) setActiveRestaurantId(matched.id);
+        } else if (serverInfo.active && serverInfo.restaurantSlug) {
+          const matched = cachedState.restaurants.find(
+            (r) => r.slug === serverInfo.restaurantSlug
+          );
+          if (matched) setActiveRestaurantId(matched.id);
+        }
+        setIsCloudBootstrapping(false);
+      }
+
       if (isSupabaseEnvConfigured()) {
-        // Hydrate from IndexedDB if localStorage snapshot wasn't available, then restore session + refresh Supabase
-        if (!initialCachedSnapshot || initialCachedSnapshot.restaurants.length === 0) {
-          const cached = await loadPlatformState(false).catch(() => null);
-          if (mounted && cached && cached.restaurants.length > 0) {
-            setRestaurants(cached.restaurants);
-            setCategories(cached.categories);
-            setMenuItems(cached.menuItems);
-            setUpdatedAt(cached.updatedAt);
-            setBaseUpdatedAt(cached.baseUpdatedAt || cached.updatedAt);
-            const urlSlug = getInitialRestaurantSlug();
-            if (urlSlug) {
-              const matched = cached.restaurants.find((r) => r.slug === urlSlug);
-              if (matched) setActiveRestaurantId(matched.id);
-            }
+        // Fast LAN path: if connected to local Windows server (e.g. phone on restaurant Wi-Fi without Internet),
+        // pull local /api/catalog immediately so the menu displays without waiting for Supabase WAN timeout.
+        if (serverInfo.active && outbox.length === 0) {
+          const fastLocal = await syncWithServer(
+            {
+              restaurants: restaurantsRef.current,
+              categories: categoriesRef.current,
+              menuItems: menuItemsRef.current,
+              users: usersRef.current,
+              updatedAt: restaurantsRef.current.length > 0 ? updatedAtRef.current : '',
+              baseUpdatedAt: baseUpdatedAtRef.current,
+            },
+            false,
+            { pullOnly: true }
+          ).catch(() => null);
+          if (mounted && fastLocal?.mergedState && fastLocal.mergedState.restaurants.length > 0) {
+            await applyAndCacheCloudState(
+              fastLocal.mergedState.restaurants,
+              fastLocal.mergedState.categories,
+              fastLocal.mergedState.menuItems,
+              fastLocal.mergedState.users
+            );
             setIsCloudBootstrapping(false);
           }
         }
+
         try {
           const sb = await loadSupabaseData();
           const restoredUser = await sb.restoreSupabaseSession();
@@ -652,13 +720,15 @@ function SmartMenuShell() {
         return;
       }
 
-      const state = await loadPlatformState(true);
+      const state = cachedState ?? (await loadPlatformState(true));
       if (!mounted) return;
       setRestaurants(state.restaurants);
       setCategories(state.categories);
       setMenuItems(state.menuItems);
       setUpdatedAt(state.updatedAt);
+      updatedAtRef.current = state.updatedAt;
       setBaseUpdatedAt(state.baseUpdatedAt || state.updatedAt);
+      baseUpdatedAtRef.current = state.baseUpdatedAt || state.updatedAt;
 
       const urlSlug = getInitialRestaurantSlug();
       if (urlSlug) {
@@ -2017,9 +2087,108 @@ function SmartMenuShell() {
 
   return (
     <div className="min-h-screen bg-[#09090B] text-zinc-100 flex flex-col">
-      <Navbar activeView={activeView} onNavigateView={handleNavigateView} />
+      <Navbar
+        activeView={activeView}
+        onNavigateView={(view, target) => {
+          setShowConnectPortal(false);
+          handleNavigateView(view, target);
+        }}
+      />
 
-      {activeView === 'customer' ? (
+      {showConnectPortal ? (
+        <main className="flex-1 flex items-center justify-center px-4 py-14 sm:py-20">
+          <div className="max-w-lg w-full rounded-2xl bg-[#141418] border border-zinc-800 p-6 sm:p-8 text-center shadow-2xl space-y-6">
+            <div className="inline-flex items-center gap-2 rounded-full bg-emerald-500/10 border border-emerald-500/30 px-3.5 py-1 text-xs font-semibold text-emerald-300">
+              <Wifi className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>{t.connect.badge}</span>
+            </div>
+
+            {activeRestaurant?.logoUrl && (
+              <img
+                src={activeRestaurant.logoUrl}
+                alt={activeRestaurant.name}
+                onError={(e) => {
+                  const img = e.currentTarget;
+                  if (activeRestaurant.logoUrl?.startsWith('http') && !img.dataset.mirrorTried) {
+                    img.dataset.mirrorTried = '1';
+                    img.src = `/api/cached-image?url=${encodeURIComponent(activeRestaurant.logoUrl)}`;
+                    return;
+                  }
+                  img.style.display = 'none';
+                }}
+                className="w-16 h-16 rounded-2xl object-cover mx-auto border border-zinc-700"
+              />
+            )}
+
+            <div className="space-y-2">
+              <h1 className="font-display text-3xl sm:text-4xl font-bold text-white tracking-tight">
+                {activeRestaurant?.name ?? t.connect.headingFallback}
+              </h1>
+              <p className="text-sm text-zinc-400 leading-relaxed">{t.connect.subtitle}</p>
+            </div>
+
+            <div className="rounded-xl bg-zinc-900/90 border border-zinc-800 p-4 text-left space-y-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-emerald-300">
+                <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
+                <span>
+                  {localServerActive || activeRestaurant
+                    ? t.connect.serverReady
+                    : t.connect.serverChecking}
+                </span>
+              </div>
+              <p className="text-xs text-zinc-400 leading-relaxed">{t.connect.offlineCacheNote}</p>
+            </div>
+
+            <button
+              type="button"
+              disabled={connectBusy}
+              onClick={async () => {
+                setConnectBusy(true);
+                try {
+                  const probe = await syncWithServer(
+                    {
+                      restaurants: restaurantsRef.current,
+                      categories: categoriesRef.current,
+                      menuItems: menuItemsRef.current,
+                      users: usersRef.current,
+                      updatedAt: restaurantsRef.current.length > 0 ? updatedAtRef.current : '',
+                      baseUpdatedAt: baseUpdatedAtRef.current,
+                    },
+                    false,
+                    { pullOnly: true }
+                  ).catch(() => null);
+                  if (probe?.mergedState && probe.mergedState.restaurants.length > 0) {
+                    await applyAndCacheCloudState(
+                      probe.mergedState.restaurants,
+                      probe.mergedState.categories,
+                      probe.mergedState.menuItems,
+                      probe.mergedState.users
+                    );
+                  }
+                } finally {
+                  setConnectBusy(false);
+                  setShowConnectPortal(false);
+                  const targetSlug = activeRestaurant?.slug || getInitialRestaurantSlug();
+                  if (typeof window !== 'undefined') {
+                    const nextParams = new URLSearchParams(window.location.search);
+                    nextParams.delete('mode');
+                    if (targetSlug) nextParams.set('restaurant', targetSlug);
+                    const query = nextParams.toString();
+                    window.history.replaceState({}, '', `/${query ? `?${query}` : ''}`);
+                  }
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                }
+              }}
+              style={{
+                backgroundColor: activeRestaurant?.primaryColor || '#DC2626',
+              }}
+              className="w-full min-h-[52px] px-5 rounded-xl text-sm sm:text-base font-bold text-white shadow-xl hover:brightness-110 disabled:opacity-60 transition cursor-pointer"
+            >
+              {connectBusy ? t.connect.checkingServer : t.connect.ctaButton}
+            </button>
+          </div>
+        </main>
+      ) : activeView === 'customer' ? (
         !activeRestaurant ? (
           isCloudBootstrapping ? (
             <main className="flex-1" aria-busy="true">
@@ -2057,7 +2226,7 @@ function SmartMenuShell() {
                 </div>
               </div>
             </main>
-          ) : (
+          ) : cloudEmptyConfirmed ? (
             <main className="flex-1 flex items-center justify-center px-4 py-24">
               <div className="max-w-lg w-full rounded-2xl bg-[#141418] border border-zinc-800 p-8 text-center space-y-4">
                 <Database className="w-10 h-10 text-orange-400 mx-auto" aria-hidden="true" />
@@ -2072,6 +2241,37 @@ function SmartMenuShell() {
                 >
                   {t.nav.pro}
                 </button>
+              </div>
+            </main>
+          ) : (
+            <main className="flex-1 flex items-center justify-center px-4 py-24">
+              <div className="max-w-lg w-full rounded-2xl bg-[#141418] border border-zinc-800 p-8 text-center space-y-4">
+                <Wifi className="w-10 h-10 text-amber-400 mx-auto" aria-hidden="true" />
+                <h1 className="font-display text-3xl font-bold text-white">
+                  {t.offline.emptyTitle}
+                </h1>
+                <p className="text-sm text-zinc-400 leading-relaxed">{t.offline.emptyBody}</p>
+                <p className="text-xs text-zinc-500 leading-relaxed">{t.offline.emptyLocalHint}</p>
+                <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsCloudBootstrapping(true);
+                      void refreshFromSupabase(true);
+                    }}
+                    className="inline-flex items-center gap-2 min-h-[44px] px-5 rounded-xl bg-red-600 hover:bg-red-500 text-sm font-semibold text-white cursor-pointer"
+                  >
+                    <RefreshCw className="w-4 h-4" aria-hidden="true" />
+                    <span>{t.offline.retryNow}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleNavigateView('pro')}
+                    className="inline-flex items-center justify-center min-h-[44px] px-5 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-sm font-medium text-white cursor-pointer"
+                  >
+                    {t.nav.pro}
+                  </button>
+                </div>
               </div>
             </main>
           )
@@ -2275,7 +2475,11 @@ function SmartMenuShell() {
         )}
 
         {qrRestaurant && (
-          <QRCodeModal restaurant={qrRestaurant} onClose={handleCloseQr} />
+          <QRCodeModal
+            restaurant={qrRestaurant}
+            canConfigure={activeView === 'pro' && Boolean(currentProUser)}
+            onClose={handleCloseQr}
+          />
         )}
       </Suspense>
 
@@ -2308,12 +2512,14 @@ function SmartMenuShell() {
 
 export default function App() {
   return (
-    <LanguageProvider>
-      <ToastProvider>
-        <CartProvider>
-          <SmartMenuShell />
-        </CartProvider>
-      </ToastProvider>
-    </LanguageProvider>
+    <ErrorBoundary>
+      <LanguageProvider>
+        <ToastProvider>
+          <CartProvider>
+            <SmartMenuShell />
+          </CartProvider>
+        </ToastProvider>
+      </LanguageProvider>
+    </ErrorBoundary>
   );
 }

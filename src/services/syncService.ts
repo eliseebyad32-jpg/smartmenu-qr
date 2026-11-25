@@ -63,6 +63,29 @@ function buildLocalAuthHeaders(extra?: Record<string, string>): Record<string, s
   };
 }
 
+function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  timeoutMs = 4500
+): Promise<Response> {
+  if (typeof AbortController === 'undefined') {
+    return fetch(input, init);
+  }
+  const controller = new AbortController();
+  const externalSignal = init?.signal;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+  }
+  const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(input, { ...init, signal: controller.signal }).finally(() => {
+    globalThis.clearTimeout(timer);
+  });
+}
+
 export type SyncStatus = 'online' | 'offline' | 'syncing' | 'conflict' | 'error';
 
 export interface LocalServerInfo {
@@ -76,6 +99,20 @@ export interface LocalServerInfo {
   pinConfigured?: boolean;
   lastCloudSyncAt?: string | null;
   hasPendingLocalChanges?: boolean;
+  wifiSsid?: string;
+  wifiSecurity?: 'WPA' | 'WEP' | 'nopass';
+  wifiConfigured?: boolean;
+  onlineBaseUrl?: string;
+  connectUrl?: string;
+  captivePortalEnabled?: boolean;
+}
+
+export interface LocalWifiConfig {
+  wifiSsid: string;
+  wifiPassword: string;
+  wifiSecurity: 'WPA' | 'WEP' | 'nopass';
+  onlineBaseUrl: string;
+  captivePortalEnabled: boolean;
 }
 
 export interface LocalAuthStatus {
@@ -124,10 +161,14 @@ let lastKnownLocalServerVersion: string | null = null;
 export async function fetchLocalServerInfo(): Promise<LocalServerInfo> {
   if (typeof window === 'undefined') return { active: false };
   try {
-    const res = await fetch('/api/server-info', {
-      method: 'GET',
-      cache: 'no-store',
-    });
+    const res = await fetchWithTimeout(
+      '/api/server-info',
+      {
+        method: 'GET',
+        cache: 'no-store',
+      },
+      3500
+    );
     const contentType = res.headers.get('content-type') || '';
     if (!res.ok || !contentType.includes('application/json')) {
       return { active: false };
@@ -145,20 +186,87 @@ export async function fetchLocalServerInfo(): Promise<LocalServerInfo> {
       pinConfigured: body.pinConfigured,
       lastCloudSyncAt: body.lastCloudSyncAt,
       hasPendingLocalChanges: Boolean(body.hasPendingLocalChanges),
+      wifiSsid: body.wifiSsid ?? '',
+      wifiSecurity:
+        body.wifiSecurity === 'WEP' || body.wifiSecurity === 'nopass' ? body.wifiSecurity : 'WPA',
+      wifiConfigured: Boolean(body.wifiConfigured),
+      onlineBaseUrl: body.onlineBaseUrl ?? '',
+      connectUrl: body.connectUrl,
+      captivePortalEnabled: body.captivePortalEnabled !== false,
     };
   } catch {
     return { active: false };
   }
 }
 
+export async function fetchLocalWifiConfig(): Promise<LocalWifiConfig | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    const res = await fetchWithTimeout(
+      '/api/local-wifi-config',
+      {
+        method: 'GET',
+        headers: buildLocalAuthHeaders(),
+        cache: 'no-store',
+      },
+      3500
+    );
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !contentType.includes('application/json')) return null;
+    const body = (await res.json()) as Partial<LocalWifiConfig> & { ok?: boolean };
+    if (!body.ok) return null;
+    return {
+      wifiSsid: body.wifiSsid ?? '',
+      wifiPassword: body.wifiPassword ?? '',
+      wifiSecurity:
+        body.wifiSecurity === 'WEP' || body.wifiSecurity === 'nopass' ? body.wifiSecurity : 'WPA',
+      onlineBaseUrl: body.onlineBaseUrl ?? '',
+      captivePortalEnabled: body.captivePortalEnabled !== false,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function saveLocalWifiConfig(
+  payload: LocalWifiConfig
+): Promise<{ ok: boolean; error?: string; config?: LocalWifiConfig }> {
+  try {
+    const res = await fetchWithTimeout(
+      '/api/local-wifi-config',
+      {
+        method: 'PUT',
+        headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(payload),
+      },
+      4500
+    );
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      error?: string;
+      config?: LocalWifiConfig;
+    };
+    if (!res.ok || !body.ok) {
+      return { ok: false, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true, config: body.config };
+  } catch {
+    return { ok: false, error: 'Serveur local inaccessible.' };
+  }
+}
+
 export async function fetchLocalAuthStatus(): Promise<LocalAuthStatus | null> {
   if (typeof window === 'undefined') return null;
   try {
-    const res = await fetch('/api/auth/local-status', {
-      method: 'GET',
-      headers: buildLocalAuthHeaders(),
-      cache: 'no-store',
-    });
+    const res = await fetchWithTimeout(
+      '/api/auth/local-status',
+      {
+        method: 'GET',
+        headers: buildLocalAuthHeaders(),
+        cache: 'no-store',
+      },
+      3500
+    );
     const contentType = res.headers.get('content-type') || '';
     if (!res.ok || !contentType.includes('application/json')) return null;
     const data = (await res.json()) as LocalAuthStatus & { ok?: boolean };
@@ -267,11 +375,15 @@ export interface LocalServerAccountAuthStatus {
 export async function fetchLocalServerAuthStatus(): Promise<LocalServerAccountAuthStatus | null> {
   if (typeof window === 'undefined') return null;
   try {
-    const res = await fetch('/api/auth/status', {
-      method: 'GET',
-      headers: buildLocalAuthHeaders(),
-      cache: 'no-store',
-    });
+    const res = await fetchWithTimeout(
+      '/api/auth/status',
+      {
+        method: 'GET',
+        headers: buildLocalAuthHeaders(),
+        cache: 'no-store',
+      },
+      3500
+    );
     const contentType = res.headers.get('content-type') || '';
     if (!res.ok || !contentType.includes('application/json')) return null;
     const data = (await res.json()) as Partial<LocalServerAccountAuthStatus> & { ok?: boolean };
@@ -374,11 +486,15 @@ export async function restoreLocalServerSession(): Promise<{
     const currentAccess = getLocalAuthToken();
     if (currentAccess) {
       try {
-        const meRes = await fetch('/api/auth/me', {
-          method: 'GET',
-          headers: buildLocalAuthHeaders(),
-          cache: 'no-store',
-        });
+        const meRes = await fetchWithTimeout(
+          '/api/auth/me',
+          {
+            method: 'GET',
+            headers: buildLocalAuthHeaders(),
+            cache: 'no-store',
+          },
+          3500
+        );
         if (meRes.ok) {
           const meBody = (await meRes.json().catch(() => ({}))) as {
             ok?: boolean;
@@ -393,11 +509,15 @@ export async function restoreLocalServerSession(): Promise<{
             };
           }
         }
-        const statusRes = await fetch('/api/auth/local-status', {
-          method: 'GET',
-          headers: buildLocalAuthHeaders(),
-          cache: 'no-store',
-        });
+        const statusRes = await fetchWithTimeout(
+          '/api/auth/local-status',
+          {
+            method: 'GET',
+            headers: buildLocalAuthHeaders(),
+            cache: 'no-store',
+          },
+          3500
+        );
         if (statusRes.ok) {
           const st = (await statusRes.json().catch(() => ({}))) as {
             ok?: boolean;
@@ -426,11 +546,15 @@ export async function restoreLocalServerSession(): Promise<{
     }
 
     try {
-      const res = await fetch('/api/auth/refresh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken: storedRefresh }),
-      });
+      const res = await fetchWithTimeout(
+        '/api/auth/refresh',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: storedRefresh }),
+        },
+        4000
+      );
       const contentType = res.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
         return { ok: false };
@@ -1132,10 +1256,14 @@ export async function syncWithServer(
   }
 
   try {
-    const healthRes = await fetch('/api/health', {
-      method: 'GET',
-      cache: 'no-store',
-    });
+    const healthRes = await fetchWithTimeout(
+      '/api/health',
+      {
+        method: 'GET',
+        cache: 'no-store',
+      },
+      3000
+    );
 
     const contentType = healthRes.headers.get('content-type') || '';
     if (!healthRes.ok || !contentType.includes('application/json')) {
@@ -1162,15 +1290,19 @@ export async function syncWithServer(
 
     // Push local catalog to Windows LAN PC server only for authenticated Pro flows
     if (canPushWrites) {
-      const pushRes = await fetch('/api/catalog', {
-        method: 'PUT',
-        headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({
-          state: { ...localState, users: [] },
-          baseUpdatedAt: forceOverwrite ? undefined : localState.baseUpdatedAt,
-          lastCloudSyncAt: options?.lastCloudSyncAt,
-        }),
-      });
+      const pushRes = await fetchWithTimeout(
+        '/api/catalog',
+        {
+          method: 'PUT',
+          headers: buildLocalAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({
+            state: { ...localState, users: [] },
+            baseUpdatedAt: forceOverwrite ? undefined : localState.baseUpdatedAt,
+            lastCloudSyncAt: options?.lastCloudSyncAt,
+          }),
+        },
+        6000
+      );
 
       if (pushRes.status === 401 || pushRes.status === 403) {
         if (pushRes.status === 401) {
@@ -1239,7 +1371,7 @@ export async function syncWithServer(
     }
 
     // Pull latest state from local PC LAN server if newer than browser cache (safe read-only)
-    const pullRes = await fetch('/api/catalog', { cache: 'no-store' });
+    const pullRes = await fetchWithTimeout('/api/catalog', { cache: 'no-store' }, 4500);
     if (pullRes.ok) {
       const body = (await pullRes.json()) as {
         state?: PlatformState & { serverSavedAt?: string };

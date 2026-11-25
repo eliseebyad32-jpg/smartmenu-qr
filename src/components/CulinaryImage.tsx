@@ -104,11 +104,13 @@ export const CulinaryImage: React.FC<CulinaryImageProps> = ({
   const cacheKey = `${src}|${variant}`;
   const [hasError, setHasError] = useState(false);
   const [useServerMirror, setUseServerMirror] = useState(false);
+  const [useLocalWebpFallback, setUseLocalWebpFallback] = useState(false);
   const [isLoaded, setIsLoaded] = useState(() => loadedImageKeys.has(cacheKey));
 
   useEffect(() => {
     setHasError(false);
     setUseServerMirror(false);
+    setUseLocalWebpFallback(false);
     if (loadedImageKeys.has(cacheKey) || (imgRef.current?.complete && imgRef.current.naturalWidth > 0)) {
       loadedImageKeys.add(cacheKey);
       setIsLoaded(true);
@@ -137,6 +139,8 @@ export const CulinaryImage: React.FC<CulinaryImageProps> = ({
   const webpSource = useServerMirror ? null : buildWebpSource(src, variant);
   const effectiveSrc = useServerMirror
     ? `/api/cached-image?url=${encodeURIComponent(src)}`
+    : useLocalWebpFallback
+    ? resolvePreferredImageUrl(src, variant === 'thumb' ? 'thumb' : 'medium')
     : variant === 'hero' && !isConstrainedConnection()
     ? src
     : resolvePreferredImageUrl(src, variant);
@@ -172,6 +176,10 @@ export const CulinaryImage: React.FC<CulinaryImageProps> = ({
             setIsLoaded(true);
           }}
           onError={() => {
+            if (!useLocalWebpFallback && isLocalDishJpg(src)) {
+              setUseLocalWebpFallback(true);
+              return;
+            }
             if (!useServerMirror && src.startsWith('http')) {
               setUseServerMirror(true);
               return;

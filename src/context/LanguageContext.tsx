@@ -8,7 +8,7 @@ interface LanguageContextValue {
   language: Language;
   setLanguage: (lang: Language) => void;
   t: (typeof UI_TRANSLATIONS)['fr'] | (typeof UI_TRANSLATIONS)['en'];
-  pick: (text: LocalizedText) => string;
+  pick: (text?: LocalizedText | string | null) => string;
   formatFC: (price: number) => string;
 }
 
@@ -43,10 +43,15 @@ export const LanguageProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     document.documentElement.lang = language;
   }, [language]);
 
-  const pick = (text: LocalizedText): string => text[language];
+  const pick = (text?: LocalizedText | string | null): string => {
+    if (!text) return '';
+    if (typeof text === 'string') return text;
+    return text[language] ?? text.fr ?? text.en ?? '';
+  };
 
   const formatFC = (price: number): string => {
-    const formatted = Math.round(price)
+    const numeric = Number(price);
+    const formatted = Math.round(Number.isFinite(numeric) ? numeric : 0)
       .toString()
       .replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
     return `${formatted} FC`;

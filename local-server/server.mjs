@@ -6,6 +6,7 @@ import path from 'path';
 import {
   atomicWriteFile,
   AUTH_FILE,
+  CONFIG_FILE,
   DATA_FILE,
   ensureDataDirectories,
   extFromMime,
@@ -161,13 +162,142 @@ function sanitizeAccount(acc) {
   };
 }
 
+function escapeHtml(raw) {
+  return String(raw || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildSafeConnectPortalHtml({ restaurantName, city, primaryColor, menuHref, tableLabel, ssid }) {
+  const safeName = escapeHtml(restaurantName || 'SMARTMENU QR');
+  const safeCity = escapeHtml(city || '');
+  const safeColor = /^#[0-9a-fA-F]{3,8}$/.test(String(primaryColor || '')) ? primaryColor : '#DC2626';
+  const safeHref = escapeHtml(menuHref || '/');
+  const safeTable = tableLabel ? ` · Table ${escapeHtml(tableLabel)}` : '';
+  const safeSsid = ssid ? escapeHtml(ssid) : 'Wi-Fi Local';
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+  <title>${safeName} — Accès Menu Local</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      background: #09090B;
+      color: #F4F4F5;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      width: 100%;
+      max-width: 440px;
+      background: #141418;
+      border: 1px solid #27272A;
+      border-radius: 20px;
+      padding: 28px 24px;
+      text-align: center;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(16, 185, 129, 0.14);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: #6EE7B7;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+    h1 { font-size: 28px; line-height: 1.15; font-weight: 800; color: #FFFFFF; }
+    .sub { margin-top: 8px; font-size: 14px; color: #A1A1AA; line-height: 1.5; }
+    .meta {
+      margin-top: 16px;
+      background: #0F0F13;
+      border: 1px solid #27272A;
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 12px;
+      color: #D4D4D8;
+      text-align: left;
+      line-height: 1.5;
+    }
+    .cta {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      min-height: 54px;
+      margin-top: 22px;
+      padding: 14px 18px;
+      border-radius: 14px;
+      border: none;
+      background: ${safeColor};
+      color: #FFFFFF;
+      font-size: 15px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .cta:hover { filter: brightness(1.08); }
+    .status { margin-top: 12px; font-size: 12px; color: #A1A1AA; min-height: 18px; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <span class="badge">${safeSsid}${safeTable}</span>
+    <h1>${safeName}</h1>
+    ${safeCity ? `<p class="sub">${safeCity}</p>` : ''}
+    <p class="sub">Vous êtes connecté au serveur local du restaurant. Appuyez sur le bouton ci-dessous pour consulter la carte complète, même sans Internet.</p>
+    <div class="meta" id="portal-meta">Serveur local prêt — Catégories, plats, prix et images disponibles hors ligne.</div>
+    <a class="cta" id="connect-btn" href="${safeHref}">CONNECTER ET ACCÉDER AU MENU</a>
+    <p class="status" id="portal-status"></p>
+  </main>
+  <script>
+    (function () {
+      var btn = document.getElementById('connect-btn');
+      var status = document.getElementById('portal-status');
+      fetch('/api/health', { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.ok) {
+            status.textContent = d.hasLocalSnapshot
+              ? 'Menu local synchronisé prêt.'
+              : 'Serveur local connecté.';
+          }
+        })
+        .catch(function () {});
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        status.textContent = 'Ouverture du menu local...';
+        window.location.assign(btn.getAttribute('href'));
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function scoreLanInterface(name, address) {
   const lower = name.toLowerCase();
   let score = 0;
   if (/wi-?fi|wlan|wireless|sans fil|ethernet|eth\d|en\d|reseau local|r[eé]seau local/i.test(lower)) {
     score += 20;
   }
-  if (/virtual|vmware|vbox|wsl|hyper-v|vethernet|docker|loopback|tailscale|hamachi/i.test(lower)) {
+  if (/wi-?fi direct|local area connection\*/i.test(lower) || address.startsWith('192.168.137.')) {
+    score += 18;
+  }
+  if (/virtualbox|vmware|wsl|hyper-v|vethernet|docker|loopback|tailscale|hamachi/i.test(lower)) {
     score -= 50;
   }
   if (address.startsWith('192.168.')) score += 15;
@@ -197,7 +327,8 @@ function getLanAddresses() {
 }
 
 export function createLocalServerApp(customOptions = {}) {
-  const config = customOptions.config ?? loadLocalConfig();
+  const config = { ...(customOptions.config ?? loadLocalConfig()) };
+  const configFile = customOptions.configFile ?? CONFIG_FILE;
   const dataFile = customOptions.dataFile ?? DATA_FILE;
   const authFile = customOptions.authFile ?? AUTH_FILE;
   const uploadsDir = customOptions.uploadsDir ?? UPLOADS_DIR;
@@ -211,6 +342,12 @@ export function createLocalServerApp(customOptions = {}) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
+  }
+
+  // Ensure any remote dish/logo/hero images in existing catalog snapshot are cached locally on disk
+  const bootSnapshot = readJsonSafe(dataFile, null);
+  if (bootSnapshot && !customOptions.skipStartupImageMirror) {
+    void Promise.resolve(mirrorImagesFn(bootSnapshot)).catch(() => {});
   }
 
   const revokedJtis = new Set();
@@ -561,19 +698,30 @@ export function createLocalServerApp(customOptions = {}) {
     });
   });
 
-  // Public server network metadata (no secrets exposed)
+  // Public server network metadata (no secrets or wifiPassword exposed)
   app.get('/api/server-info', (_req, res) => {
     const lans = getLanAddresses();
     const state = readLocalCatalog();
     const imageMap = readJsonSafe(imageMapFile, {});
     const authRecord = readAuthRecord();
+    const primaryLan = getPrimaryLanUrl();
+    const slug =
+      config.restaurantSlug ||
+      state?.restaurants?.[0]?.slug ||
+      '';
     res.json({
       ok: true,
       mode: 'local-lan-server',
       port: config.port,
       lanUrls: lans.map((ip) => `http://${ip}:${config.port}`),
-      primaryLanUrl: getPrimaryLanUrl(),
+      primaryLanUrl: primaryLan,
       configuredPublicUrl: config.publicLanUrl || null,
+      onlineBaseUrl: config.onlineBaseUrl || '',
+      wifiSsid: config.wifiSsid || '',
+      wifiSecurity: config.wifiSecurity || 'WPA',
+      wifiConfigured: Boolean(config.wifiSsid),
+      captivePortalEnabled: config.captivePortalEnabled !== false,
+      connectUrl: `${primaryLan}/connect${slug ? `?restaurant=${encodeURIComponent(slug)}` : ''}`,
       restaurantId: config.restaurantId || null,
       restaurantSlug: config.restaurantSlug || null,
       hasLocalSnapshot: Boolean(state),
@@ -582,6 +730,63 @@ export function createLocalServerApp(customOptions = {}) {
       hasPendingLocalChanges: Boolean(state?.hasPendingLocalChanges),
       cachedImagesCount: Object.keys(imageMap).length,
       updatedAt: state?.updatedAt || null,
+    });
+  });
+
+  // Protected local Wi-Fi & Dual QR settings (Pro session required so wifiPassword stays private)
+  app.get('/api/local-wifi-config', requireLocalProAuth, (_req, res) => {
+    res.json({
+      ok: true,
+      wifiSsid: config.wifiSsid || '',
+      wifiPassword: config.wifiPassword || '',
+      wifiSecurity: config.wifiSecurity || 'WPA',
+      onlineBaseUrl: config.onlineBaseUrl || '',
+      captivePortalEnabled: config.captivePortalEnabled !== false,
+    });
+  });
+
+  app.put('/api/local-wifi-config', requireLocalProAuth, (req, res) => {
+    const body = req.body || {};
+    const nextSsid = String(body.wifiSsid ?? '').trim().slice(0, 64);
+    const nextSecurityRaw = String(body.wifiSecurity ?? 'WPA').trim();
+    const nextSecurity =
+      nextSecurityRaw === 'WEP' || nextSecurityRaw === 'nopass' ? nextSecurityRaw : 'WPA';
+    const nextPassword =
+      nextSecurity === 'nopass' ? '' : String(body.wifiPassword ?? '').slice(0, 64);
+    const rawOnlineUrl = String(body.onlineBaseUrl ?? '').trim().replace(/\/+$/, '');
+    if (rawOnlineUrl && !/^https?:\/\/[a-zA-Z0-9.-]+(:\d+)?(\/.*)?$/.test(rawOnlineUrl)) {
+      return res.status(400).json({ error: 'URL publique en ligne invalide (http:// ou https:// requis).' });
+    }
+    const nextCaptive = body.captivePortalEnabled !== false;
+
+    config.wifiSsid = nextSsid;
+    config.wifiPassword = nextPassword;
+    config.wifiSecurity = nextSecurity;
+    config.onlineBaseUrl = rawOnlineUrl;
+    config.captivePortalEnabled = nextCaptive;
+
+    const existingFileCfg = readJsonSafe(configFile, {});
+    const mergedFileCfg = {
+      ...existingFileCfg,
+      port: existingFileCfg.port ?? config.port,
+      wifiSsid: nextSsid,
+      wifiPassword: nextPassword,
+      wifiSecurity: nextSecurity,
+      onlineBaseUrl: rawOnlineUrl,
+      captivePortalEnabled: nextCaptive,
+    };
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    atomicWriteFile(configFile, `${JSON.stringify(mergedFileCfg, null, 2)}\n`);
+
+    return res.json({
+      ok: true,
+      config: {
+        wifiSsid: config.wifiSsid,
+        wifiPassword: config.wifiPassword,
+        wifiSecurity: config.wifiSecurity,
+        onlineBaseUrl: config.onlineBaseUrl,
+        captivePortalEnabled: config.captivePortalEnabled,
+      },
     });
   });
 
@@ -1587,15 +1792,101 @@ export function createLocalServerApp(customOptions = {}) {
     return res.sendFile(fullPath);
   });
 
+  // Self-contained Local Wi-Fi Welcome Portal ("CONNECTER ET ACCÉDER AU MENU")
+  function resolveConnectPortalContext(req) {
+    const state = readLocalCatalog();
+    const restaurants = (state?.restaurants || []).filter(isScopedRestaurant);
+    const reqSlug = String(req.query.restaurant || '').trim();
+    const tableLabel = String(req.query.table || '').trim();
+    const target =
+      (reqSlug ? restaurants.find((r) => r.slug === reqSlug) : null) ||
+      (config.restaurantSlug ? restaurants.find((r) => r.slug === config.restaurantSlug) : null) ||
+      restaurants[0] ||
+      null;
+    const slug = target?.slug || reqSlug || config.restaurantSlug || '';
+    const params = new URLSearchParams();
+    if (slug) params.set('restaurant', slug);
+    if (tableLabel) params.set('table', tableLabel);
+    const q = params.toString();
+    return {
+      restaurantName: target?.name || 'SMARTMENU QR',
+      city: target?.city || '',
+      primaryColor: target?.primaryColor || '#DC2626',
+      menuHref: `/${q ? `?${q}` : ''}`,
+      portalHref: `/connect${q ? `?${q}` : ''}`,
+      tableLabel,
+      ssid: config.wifiSsid || '',
+    };
+  }
+
+  app.get(['/connect', '/welcome'], (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    const ctx = resolveConnectPortalContext(req);
+    return res.status(200).send(buildSafeConnectPortalHtml(ctx));
+  });
+
+  // Captive portal probe endpoints (Android / iOS / Windows OS probes when router/DNS points here)
+  const captiveProbePaths = [
+    '/generate_204',
+    '/gen_204',
+    '/hotspot-detect.html',
+    '/library/test/success.html',
+    '/connecttest.txt',
+    '/ncsi.txt',
+    '/canonical.html',
+  ];
+  app.all(captiveProbePaths, (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    if (config.captivePortalEnabled === false) {
+      return res.status(204).end();
+    }
+    const ctx = resolveConnectPortalContext(req);
+    return res.redirect(302, ctx.portalHref);
+  });
+
   app.use('/local-uploads', express.static(uploadsDir, { maxAge: '30d' }));
   app.use('/local-cache', express.static(imageCacheDir, { maxAge: '30d' }));
+  app.use(['/local-uploads', '/local-cache'], (_req, res) => res.status(404).end());
 
   // Serve built Vite PWA static files unless disabled in tests
   if (!customOptions.disableStatic && fs.existsSync(distDir)) {
-    app.use(express.static(distDir, { maxAge: '1d' }));
-    app.use('/src/assets', (_req, res) => res.status(404).end());
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+    const noStoreHeaders = (res) => {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    };
+
+    app.use(
+      express.static(distDir, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          const normalized = filePath.replace(/\\/g, '/');
+          const base = path.basename(normalized);
+          if (
+            base === 'index.html' ||
+            base === 'sw.js' ||
+            base === 'registerSW.js' ||
+            base === 'manifest.webmanifest' ||
+            /^workbox-.*\.js$/i.test(base)
+          ) {
+            noStoreHeaders(res);
+          } else if (normalized.includes('/assets/')) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      })
+    );
+
+    // Never serve index.html for missing JS/CSS/media assets (fixes MIME / blank white screen errors)
+    app.use(['/assets', '/src/assets'], (_req, res) => res.status(404).end());
+    app.get('*', (req, res) => {
+      if (/\.[a-z0-9]{1,8}$/i.test(req.path) && !/\.html?$/i.test(req.path)) {
+        return res.status(404).end();
+      }
+      noStoreHeaders(res);
+      return res.sendFile(path.join(distDir, 'index.html'));
     });
   } else if (!customOptions.disableStatic) {
     app.get('/', (_req, res) => {

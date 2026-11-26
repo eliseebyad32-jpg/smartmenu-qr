@@ -897,6 +897,26 @@ function SmartMenuShell() {
     };
   }, [supabaseEnabled, localServerActive, currentProUser?.id, currentProUser?.role]);
 
+  const handleAuthUserChange = useCallback((user: PlatformUser | null) => {
+    currentProUserRef.current = user;
+    setCurrentProUser((prev) => {
+      if (
+        prev?.id === user?.id &&
+        prev?.role === user?.role &&
+        prev?.username === user?.username &&
+        prev?.name === user?.name &&
+        prev?.assignedRestaurantId === user?.assignedRestaurantId &&
+        prev?.isActive === user?.isActive
+      ) {
+        return prev;
+      }
+      return user;
+    });
+    if (!user) {
+      setUsers((prev) => (prev.length === 0 ? prev : []));
+    }
+  }, []);
+
   const activeRestaurant =
     restaurants.find((r) => r.id === activeRestaurantId) ?? restaurants[0] ?? null;
 
@@ -2395,13 +2415,7 @@ function SmartMenuShell() {
             }}
             localServerActive={localServerActive}
             localAuthRequired={localAuthRequired}
-            onAuthUserChange={(user) => {
-              currentProUserRef.current = user;
-              setCurrentProUser(user);
-              if (!user) {
-                setUsers([]);
-              }
-            }}
+            onAuthUserChange={handleAuthUserChange}
             onLocalAuthSuccess={async () => {
               setLocalAuthRequired(false);
               const outbox = await loadOutbox();

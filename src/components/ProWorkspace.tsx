@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Database,
@@ -298,10 +298,19 @@ export const ProWorkspace: React.FC<ProWorkspaceProps> = ({
   }, [supabaseReady, localServerActive]);
 
   const currentUser = supabaseReady ? supabaseUser : localAccountUser;
+  const onAuthUserChangeRef = useRef(onAuthUserChange);
+  onAuthUserChangeRef.current = onAuthUserChange;
 
   useEffect(() => {
-    onAuthUserChange?.(currentUser);
-  }, [currentUser, onAuthUserChange]);
+    onAuthUserChangeRef.current?.(currentUser);
+  }, [
+    currentUser?.id,
+    currentUser?.role,
+    currentUser?.username,
+    currentUser?.name,
+    currentUser?.assignedRestaurantId,
+    currentUser?.isActive,
+  ]);
 
   useEffect(() => {
     if (currentUser?.role === 'super_admin') {

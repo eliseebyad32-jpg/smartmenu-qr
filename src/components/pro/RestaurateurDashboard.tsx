@@ -261,6 +261,7 @@ export const RestaurateurDashboard: React.FC<RestaurateurDashboardProps> = ({
             <img
               src={restaurant.logoUrl}
               alt={restaurant.name}
+              referrerPolicy="no-referrer"
               onError={(e) => {
                 const img = e.currentTarget;
                 if (restaurant.logoUrl?.startsWith('http') && !img.dataset.mirrorTried) {

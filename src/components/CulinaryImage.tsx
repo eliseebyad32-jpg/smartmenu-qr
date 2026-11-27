@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ImageOff } from 'lucide-react';
 import { useLanguage } from '../context/LanguageContext';
 
@@ -62,22 +62,13 @@ function buildWebpSource(
 
   const thumbUrl = src.replace(/\.jpg$/, '-thumb.webp');
   const mdUrl = src.replace(/\.jpg$/, '-md.webp');
-  const constrained = isConstrainedConnection();
 
   if (variant === 'thumb') {
-    if (constrained) {
-      return { srcSet: thumbUrl };
-    }
-    return {
-      srcSet: `${thumbUrl} 280w, ${mdUrl} 800w`,
-      sizes: '(max-width: 640px) 112px, 128px',
-    };
+    // Always use the precached 280px WebP thumbnail for 96-112px cards so retina devices stay 100% offline-ready
+    return { srcSet: thumbUrl };
   }
 
   if (variant === 'hero') {
-    if (constrained) {
-      return { srcSet: mdUrl };
-    }
     return {
       srcSet: `${mdUrl} 800w`,
       sizes: '100vw',
@@ -102,24 +93,33 @@ export const CulinaryImage: React.FC<CulinaryImageProps> = ({
   const { t } = useLanguage();
   const imgRef = useRef<HTMLImageElement | null>(null);
   const cacheKey = `${src}|${variant}`;
-  const [hasError, setHasError] = useState(false);
-  const [useServerMirror, setUseServerMirror] = useState(false);
-  const [useLocalWebpFallback, setUseLocalWebpFallback] = useState(false);
+  // Fallback ladder:
+  // 0 = primary preferred variant
+  // 1 = precached -thumb.webp (for local dish JPGs)
+  // 2 = original .jpg (for local dish JPGs)
+  // 3 = local server /api/cached-image mirror (for http or /local-uploads/)
+  // 4 = exhausted -> ImageOff placeholder
+  const [fallbackStep, setFallbackStep] = useState(0);
   const [isLoaded, setIsLoaded] = useState(() => loadedImageKeys.has(cacheKey));
 
   useEffect(() => {
-    setHasError(false);
-    setUseServerMirror(false);
-    setUseLocalWebpFallback(false);
-    if (loadedImageKeys.has(cacheKey) || (imgRef.current?.complete && imgRef.current.naturalWidth > 0)) {
-      loadedImageKeys.add(cacheKey);
+    setFallbackStep(0);
+    if (loadedImageKeys.has(cacheKey)) {
       setIsLoaded(true);
     } else {
       setIsLoaded(false);
     }
   }, [cacheKey]);
 
-  if (hasError || !src) {
+  useLayoutEffect(() => {
+    const el = imgRef.current;
+    if (el && el.complete && el.naturalWidth > 0) {
+      loadedImageKeys.add(cacheKey);
+      setIsLoaded(true);
+    }
+  }, [cacheKey, fallbackStep]);
+
+  if (fallbackStep >= 4 || !src) {
     return (
       <div
         role="img"
@@ -136,24 +136,64 @@ export const CulinaryImage: React.FC<CulinaryImageProps> = ({
     );
   }
 
-  const webpSource = useServerMirror ? null : buildWebpSource(src, variant);
-  const effectiveSrc = useServerMirror
-    ? `/api/cached-image?url=${encodeURIComponent(src)}`
-    : useLocalWebpFallback
-    ? resolvePreferredImageUrl(src, variant === 'thumb' ? 'thumb' : 'medium')
-    : variant === 'hero' && !isConstrainedConnection()
-    ? src
-    : resolvePreferredImageUrl(src, variant);
+  const webpSource = fallbackStep === 0 ? buildWebpSource(src, variant) : null;
+
+  let effectiveSrc = src;
+  if (fallbackStep === 0) {
+    effectiveSrc =
+      variant === 'hero' && !isConstrainedConnection()
+        ? src
+        : resolvePreferredImageUrl(src, variant);
+  } else if (fallbackStep === 1 && isLocalDishJpg(src)) {
+    effectiveSrc = resolvePreferredImageUrl(src, 'thumb');
+  } else if (fallbackStep === 2 && isLocalDishJpg(src)) {
+    effectiveSrc = src;
+  } else if (fallbackStep === 3 && (src.startsWith('http') || src.startsWith('/local-uploads/'))) {
+    effectiveSrc = `/api/cached-image?url=${encodeURIComponent(src)}`;
+  }
+
+  const handleImageError = () => {
+    if (fallbackStep === 0) {
+      if (isLocalDishJpg(src)) {
+        const primaryUrl = resolvePreferredImageUrl(src, variant);
+        const thumbUrl = resolvePreferredImageUrl(src, 'thumb');
+        if (primaryUrl !== thumbUrl) {
+          setFallbackStep(1);
+          return;
+        }
+        setFallbackStep(2);
+        return;
+      }
+      if (src.startsWith('http') || src.startsWith('/local-uploads/')) {
+        setFallbackStep(3);
+        return;
+      }
+      setFallbackStep(4);
+      return;
+    }
+
+    if (fallbackStep === 1) {
+      setFallbackStep(2);
+      return;
+    }
+
+    if (fallbackStep === 2) {
+      setFallbackStep(4);
+      return;
+    }
+
+    setFallbackStep(4);
+  };
 
   return (
-    <div className="relative w-full h-full overflow-hidden bg-zinc-900">
+    <div className="relative z-0 w-full h-full overflow-hidden bg-zinc-900">
       {!isLoaded && (
         <div
           aria-hidden="true"
-          className="absolute inset-0 bg-gradient-to-br from-zinc-900 via-zinc-800/70 to-zinc-900 animate-pulse"
+          className="absolute inset-0 z-0 bg-gradient-to-br from-zinc-900 via-zinc-800/70 to-zinc-900 animate-pulse pointer-events-none"
         />
       )}
-      <picture className="block w-full h-full">
+      <picture className="relative z-[1] block w-full h-full">
         {webpSource && (
           <source
             type="image/webp"
@@ -167,28 +207,16 @@ export const CulinaryImage: React.FC<CulinaryImageProps> = ({
           alt={alt}
           width={width}
           height={height}
-          loading={priority ? 'eager' : 'lazy'}
+          loading="eager"
           decoding="async"
-          fetchPriority={priority ? 'high' : 'low'}
+          fetchPriority={priority ? 'high' : 'auto'}
           referrerPolicy="no-referrer"
           onLoad={() => {
             loadedImageKeys.add(cacheKey);
             setIsLoaded(true);
           }}
-          onError={() => {
-            if (!useLocalWebpFallback && isLocalDishJpg(src)) {
-              setUseLocalWebpFallback(true);
-              return;
-            }
-            if (!useServerMirror && src.startsWith('http')) {
-              setUseServerMirror(true);
-              return;
-            }
-            setHasError(true);
-          }}
-          className={`${className} transition-opacity duration-200 ${
-            isLoaded ? 'opacity-100' : 'opacity-0'
-          }`}
+          onError={handleImageError}
+          className={`${className} opacity-100`}
         />
       </picture>
     </div>

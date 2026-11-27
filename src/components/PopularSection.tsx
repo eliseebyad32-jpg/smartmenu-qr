@@ -35,7 +35,7 @@ export const PopularSection: React.FC<PopularSectionProps> = ({
   };
 
   return (
-    <section id="popular" className="py-14 sm:py-18 border-b border-zinc-800/70 bg-[#09090B] cv-auto">
+    <section id="popular" className="py-14 sm:py-18 border-b border-zinc-800/70 bg-[#09090B]">
       <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
         <div className="max-w-2xl mb-8">
           <p style={{ color: primary }} className="text-xs sm:text-sm font-semibold tracking-wide">

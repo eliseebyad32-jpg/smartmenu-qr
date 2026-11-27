@@ -5,7 +5,28 @@ import path from 'path';
 import {defineConfig} from 'vite';
 import {VitePWA} from 'vite-plugin-pwa';
 
-export default defineConfig(() => {
+export default defineConfig(({ command }) => {
+  const devRuntimeCaching =
+    command === 'serve'
+      ? [
+          {
+            urlPattern: /^https?:\/\/[^/]+\/(?:src|@vite|@react-refresh|node_modules)\/.*/i,
+            handler: 'NetworkFirst' as const,
+            options: {
+              cacheName: 'smartmenu-vite-dev-modules-v1',
+              networkTimeoutSeconds: 3,
+              expiration: {
+                maxEntries: 300,
+                maxAgeSeconds: 60 * 60 * 24,
+              },
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
+            },
+          },
+        ]
+      : [];
+
   return {
     plugins: [
       react(),
@@ -49,9 +70,12 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          // Precache lightweight shell + crisp dish thumbnails (~1.5 MB total vs 36 MB raw JPGs)
-          // so slow mobile connections never saturate bandwidth on first install.
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}', '**/*-thumb.webp'],
+          // Precache app shell + all dish thumbnails + hero medium WebPs so offline QR scans render completely on first cache
+          globPatterns: [
+            '**/*.{js,css,html,ico,png,svg,woff,woff2}',
+            '**/*-thumb.webp',
+            '**/hero_*-md.webp',
+          ],
           maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
           cleanupOutdatedCaches: true,
           clientsClaim: true,
@@ -64,8 +88,9 @@ export default defineConfig(() => {
             /^\/assets\//,
             /\/[^/?]+\.[a-zA-Z0-9]{1,8}$/,
           ],
-          ignoreURLParametersMatching: [/^restaurant$/, /^table$/, /^mode$/, /^wifi$/, /^utm_/, /^fbclid$/],
+          ignoreURLParametersMatching: [/.*/],
           runtimeCaching: [
+            ...devRuntimeCaching,
             {
               urlPattern: /\/src\/assets\/images\/.*\.(?:webp|jpg|jpeg|avif|png)$/i,
               handler: 'CacheFirst',
@@ -156,6 +181,7 @@ export default defineConfig(() => {
         devOptions: {
           enabled: true,
           type: 'module',
+          navigateFallbackAllowlist: [/^\/$/, /^\/connect\/?$/],
         },
       }),
       // Copies src/assets into dist/ during writeBundle (before VitePWA closeBundle)

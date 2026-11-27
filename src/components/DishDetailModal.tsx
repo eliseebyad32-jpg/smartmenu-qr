@@ -82,7 +82,7 @@ export const DishDetailModal: React.FC<DishDetailModalProps> = ({
             type="button"
             onClick={onClose}
             aria-label={t.menu.close}
-            className="absolute top-3 right-3 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-full bg-black/70 text-white hover:bg-black transition-colors cursor-pointer"
+            className="absolute top-3 right-3 z-20 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-full bg-black/70 text-white hover:bg-black transition-colors cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>

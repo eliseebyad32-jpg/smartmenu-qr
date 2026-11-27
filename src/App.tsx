@@ -21,6 +21,7 @@ import {
 } from './data/seedData';
 import {
   getLastConsultedRestaurant,
+  resetMediaPrefetchState,
   scheduleRestaurantMediaCaching,
 } from './services/offlineMediaCache';
 import {
@@ -130,6 +131,15 @@ function readStoredActiveView(): AppView {
     }
     if (window.location.hash.includes('type=recovery')) {
       return 'pro';
+    }
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('view') === 'pro') {
+      return 'pro';
+    }
+    // Public QR scan URLs (?restaurant=... or ?table=...) always open the customer menu directly
+    // with zero login gate, even if Espace Pro was opened earlier on the same browser.
+    if (params.has('restaurant') || params.has('table')) {
+      return 'customer';
     }
     const raw = window.localStorage.getItem(ACTIVE_VIEW_KEY);
     return raw === 'pro' ? 'pro' : 'customer';
@@ -705,10 +715,22 @@ function SmartMenuShell() {
 
         try {
           const sb = await loadSupabaseData();
-          const restoredUser = await sb.restoreSupabaseSession();
-          if (mounted && restoredUser) {
-            currentProUserRef.current = restoredUser;
-            setCurrentProUser(restoredUser);
+          if (activeViewRef.current === 'pro' || outbox.length > 0) {
+            const restoredUser = await sb.restoreSupabaseSession();
+            if (mounted && restoredUser) {
+              currentProUserRef.current = restoredUser;
+              setCurrentProUser(restoredUser);
+            }
+          } else {
+            void sb
+              .restoreSupabaseSession()
+              .then((restoredUser) => {
+                if (mounted && restoredUser) {
+                  currentProUserRef.current = restoredUser;
+                  setCurrentProUser(restoredUser);
+                }
+              })
+              .catch(() => null);
           }
           if (serverInfo.active) {
             await restoreLocalServerSession().catch(() => null);
@@ -770,8 +792,9 @@ function SmartMenuShell() {
     const handleOnline = async () => {
       setRetryStoppedPermanent(false);
       setAutoRetryAt(null);
+      resetMediaPrefetchState();
       if (isSupabaseEnvConfigured()) {
-        if (!currentProUserRef.current) {
+        if (!currentProUserRef.current && (activeViewRef.current === 'pro' || pendingCountRef.current > 0)) {
           try {
             const sb = await loadSupabaseData();
             const restored = await sb.restoreSupabaseSession();
@@ -794,6 +817,17 @@ function SmartMenuShell() {
         }
         const latest = await loadPlatformState(true);
         await runSync(latest, false, false);
+      }
+      if (mounted) {
+        const currentRest =
+          restaurantsRef.current.find((r) => r.id === activeRestaurantIdRef.current) ??
+          restaurantsRef.current[0];
+        if (currentRest) {
+          scheduleRestaurantMediaCaching(
+            currentRest,
+            menuItemsRef.current.filter((m) => m.restaurantId === currentRest.id)
+          );
+        }
       }
     };
     const handleOffline = () => {
@@ -2127,6 +2161,7 @@ function SmartMenuShell() {
               <img
                 src={activeRestaurant.logoUrl}
                 alt={activeRestaurant.name}
+                referrerPolicy="no-referrer"
                 onError={(e) => {
                   const img = e.currentTarget;
                   if (activeRestaurant.logoUrl?.startsWith('http') && !img.dataset.mirrorTried) {

@@ -835,6 +835,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <img
                         src={editingRest.logoUrl}
                         alt={editingRest.name}
+                        referrerPolicy="no-referrer"
                         className="w-14 h-14 rounded-xl object-cover border border-zinc-700"
                       />
                     ) : (
@@ -971,6 +972,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <img
                             src={rest.logoUrl}
                             alt={rest.name}
+                            referrerPolicy="no-referrer"
                             className="w-11 h-11 rounded-xl object-cover border border-zinc-700 shrink-0"
                           />
                         ) : (

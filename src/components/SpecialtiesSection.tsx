@@ -35,7 +35,7 @@ export const SpecialtiesSection: React.FC<SpecialtiesSectionProps> = ({
   };
 
   return (
-    <section id="specialties" className="py-14 sm:py-18 border-b border-zinc-800/70 bg-[#0C0C0F] cv-auto">
+    <section id="specialties" className="py-14 sm:py-18 border-b border-zinc-800/70 bg-[#0C0C0F]">
       <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
         <div className="max-w-2xl mb-8">
           <p style={{ color: secondary }} className="text-xs sm:text-sm font-semibold tracking-wide">

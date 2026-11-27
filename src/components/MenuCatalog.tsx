@@ -114,7 +114,7 @@ export const MenuCatalog: React.FC<MenuCatalogProps> = ({
   };
 
   return (
-    <section id="menu" className="py-12 sm:py-20 border-b border-zinc-800/70 bg-[#0B0B0E] cv-auto">
+    <section id="menu" className="py-12 sm:py-20 border-b border-zinc-800/70 bg-[#0B0B0E]">
       <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
         <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 mb-6">
           <div className="max-w-2xl">
@@ -269,7 +269,7 @@ export const MenuCatalog: React.FC<MenuCatalogProps> = ({
                     onSelectDish(dish);
                   }
                 }}
-                className={`cv-card group text-left flex items-stretch gap-3.5 sm:gap-4 rounded-2xl bg-[#141418] border p-3 sm:p-3.5 transition-transform duration-150 hover:-translate-y-0.5 cursor-pointer focus-visible:outline-2 focus-visible:outline-orange-500 ${
+                className={`group text-left flex items-stretch gap-3.5 sm:gap-4 rounded-2xl bg-[#141418] border p-3 sm:p-3.5 transition-transform duration-150 hover:-translate-y-0.5 cursor-pointer focus-visible:outline-2 focus-visible:outline-orange-500 ${
                   dish.isAvailable
                     ? 'border-zinc-800/90 hover:border-orange-500/50'
                     : 'border-zinc-800/60 opacity-75 hover:opacity-95'

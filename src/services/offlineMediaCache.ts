@@ -69,16 +69,36 @@ async function cacheImageUrlIfMissing(url: string): Promise<boolean> {
     const existing = await cache.match(url);
     if (existing) return true;
 
-    const isCrossOrigin = url.startsWith('http') && !url.startsWith(window.location.origin);
-    const response = await fetch(url, {
-      mode: isCrossOrigin ? 'cors' : 'same-origin',
-      credentials: 'omit',
-    });
-    if (response.ok || response.type === 'opaque') {
-      await cache.put(url, response.clone());
-      return true;
+    // Local thumbnails are already precached by Workbox under ?__WB_REVISION__
+    if (url.startsWith('/src/assets/images/') && url.endsWith('-thumb.webp')) {
+      const precached = await window.caches.match(url, { ignoreSearch: true });
+      if (precached) return true;
     }
-    return false;
+
+    const isCrossOrigin = url.startsWith('http') && !url.startsWith(window.location.origin);
+    try {
+      const response = await fetch(url, {
+        mode: isCrossOrigin ? 'cors' : 'same-origin',
+        credentials: 'omit',
+      });
+      if (response.ok || response.type === 'opaque') {
+        await cache.put(url, response.clone());
+        return true;
+      }
+      return false;
+    } catch {
+      if (!isCrossOrigin) return false;
+      // Retry cross-origin images without CORS so <img> still works offline via opaque cache
+      const opaqueResponse = await fetch(url, {
+        mode: 'no-cors',
+        credentials: 'omit',
+      });
+      if (opaqueResponse.type === 'opaque' || opaqueResponse.ok) {
+        await cache.put(url, opaqueResponse.clone());
+        return true;
+      }
+      return false;
+    }
   } catch {
     // Never interrupt rendering on optional offline media prefetch failure
     return false;
@@ -87,9 +107,13 @@ async function cacheImageUrlIfMissing(url: string): Promise<boolean> {
 
 const activePrefetches = new Set<string>();
 
+export function resetMediaPrefetchState(): void {
+  activePrefetches.clear();
+}
+
 /**
- * Downloads and stores menu photos (hero, logo, and visible/catalog dish WebPs or Supabase assets)
- * in Cache Storage after initial render so subsequent offline QR scans render complete visuals.
+ * Downloads and stores menu photos (hero, logo, and dish WebPs or Supabase/local assets)
+ * in Cache Storage right after initial render so subsequent offline QR scans render complete visuals.
  */
 export function scheduleRestaurantMediaCaching(
   restaurant: Restaurant,
@@ -108,33 +132,37 @@ export function scheduleRestaurantMediaCaching(
 
   if (isSaveDataEnabled()) return;
 
-  const signature = `${restaurant.id}:${items.length}:${restaurant.heroImage}:${restaurant.logoUrl ?? ''}`;
+  const scopedItems = items.filter((item) => item.restaurantId === restaurant.id);
+  const imageDigest = scopedItems.map((item) => `${item.id}:${item.image}`).join('|');
+  const signature = `${restaurant.id}:${restaurant.updatedAt ?? ''}:${restaurant.heroImage}:${restaurant.logoUrl ?? ''}:${imageDigest}`;
   if (activePrefetches.has(signature)) return;
   activePrefetches.add(signature);
 
-  const urls = new Set<string>();
+  const priorityUrls = new Set<string>();
+  const secondaryUrls = new Set<string>();
 
   if (restaurant.heroImage) {
-    urls.add(resolvePreferredImageUrl(restaurant.heroImage, 'hero'));
-    urls.add(restaurant.heroImage);
+    priorityUrls.add(resolvePreferredImageUrl(restaurant.heroImage, 'hero'));
+    priorityUrls.add(resolvePreferredImageUrl(restaurant.heroImage, 'thumb'));
+    priorityUrls.add(restaurant.heroImage);
   }
   if (restaurant.logoUrl) {
-    urls.add(restaurant.logoUrl);
+    priorityUrls.add(restaurant.logoUrl);
   }
 
-  for (const item of items) {
-    if (item.restaurantId !== restaurant.id || !item.image) continue;
-    urls.add(resolvePreferredImageUrl(item.image, 'thumb'));
-    urls.add(resolvePreferredImageUrl(item.image, 'medium'));
+  for (const item of scopedItems) {
+    if (!item.image) continue;
+    priorityUrls.add(resolvePreferredImageUrl(item.image, 'thumb'));
+    secondaryUrls.add(resolvePreferredImageUrl(item.image, 'medium'));
     if (item.image.startsWith('http') || item.image.startsWith('/local-uploads/')) {
-      urls.add(item.image);
+      priorityUrls.add(item.image);
     }
   }
 
-  const queue = [...urls];
+  const queue = [...priorityUrls, ...secondaryUrls];
   const runQueue = async () => {
     let hasFailure = false;
-    const concurrency = 2;
+    const concurrency = 4;
     const workers = Array.from({ length: concurrency }, async () => {
       while (queue.length > 0 && navigator.onLine) {
         const nextUrl = queue.shift();
@@ -150,17 +178,7 @@ export function scheduleRestaurantMediaCaching(
     }
   };
 
-  const idle = (window as Window & {
-    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
-  }).requestIdleCallback;
-
-  if (typeof idle === 'function') {
-    idle(() => {
-      void runQueue();
-    }, { timeout: 2500 });
-  } else {
-    window.setTimeout(() => {
-      void runQueue();
-    }, 900);
-  }
+  window.setTimeout(() => {
+    void runQueue();
+  }, 150);
 }

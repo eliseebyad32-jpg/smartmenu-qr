@@ -39,11 +39,11 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
           />
           <div
             aria-hidden="true"
-            className="absolute inset-0 bg-gradient-to-r from-[#09090B] via-[#09090B]/85 to-[#09090B]/30"
+            className="absolute inset-0 bg-gradient-to-r from-[#09090B]/90 via-[#09090B]/50 to-[#09090B]/15 pointer-events-none"
           />
           <div
             aria-hidden="true"
-            className="absolute inset-0 bg-gradient-to-t from-[#09090B] via-transparent to-[#09090B]/40"
+            className="absolute inset-0 bg-gradient-to-t from-[#09090B]/75 via-transparent to-[#09090B]/20 pointer-events-none"
           />
         </div>
 
@@ -58,6 +58,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                   height={64}
                   decoding="async"
                   fetchPriority="high"
+                  referrerPolicy="no-referrer"
                   onError={(e) => {
                     const img = e.currentTarget;
                     if (

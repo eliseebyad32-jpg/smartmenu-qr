@@ -26,13 +26,48 @@ function isLocalHostname(hostname: string): boolean {
   return false;
 }
 
+export function isPrivateAiStudioDevHost(hostname: string): boolean {
+  return /^ais-dev-[a-z0-9.-]+\.run\.app$/i.test(hostname.trim());
+}
+
+export function isPrivateAiStudioDevUrl(rawUrl: string): boolean {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+    return isPrivateAiStudioDevHost(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Converts private AI Studio dev URLs (`ais-dev-*.run.app`, which require Google Sign-In)
+ * into the corresponding public shared URL (`ais-pre-*.run.app`) so QR scans open directly
+ * for restaurant customers without any Google account prompt.
+ */
+export function mapToPublicOnlineOrigin(rawUrl: string): string {
+  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  try {
+    const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+    const parsed = new URL(withProtocol);
+    if (isPrivateAiStudioDevHost(parsed.hostname)) {
+      parsed.hostname = parsed.hostname.replace(/^ais-dev-/i, 'ais-pre-');
+    }
+    return parsed.origin.replace(/\/+$/, '');
+  } catch {
+    return trimmed;
+  }
+}
+
 export function getDefaultOnlineBaseUrl(): string {
   const envPublic = (import.meta.env.VITE_PUBLIC_APP_URL as string | undefined)?.trim();
   if (envPublic && /^https?:\/\//i.test(envPublic)) {
-    return envPublic.replace(/\/+$/, '');
+    return mapToPublicOnlineOrigin(envPublic);
   }
   if (typeof window !== 'undefined' && !isLocalHostname(window.location.hostname)) {
-    return window.location.origin.replace(/\/+$/, '');
+    return mapToPublicOnlineOrigin(window.location.origin);
   }
   return '';
 }
@@ -62,11 +97,17 @@ export function readStoredDualQrSettings(restaurantId: string): DualQrSettings {
     const raw = window.localStorage.getItem(`${SETTINGS_STORAGE_PREFIX}${restaurantId}`);
     if (!raw) return defaults;
     const parsed = JSON.parse(raw) as Partial<DualQrSettings>;
+    const rawSavedUrl =
+      typeof parsed.onlineBaseUrl === 'string' && parsed.onlineBaseUrl.trim()
+        ? normalizeBaseUrl(parsed.onlineBaseUrl)
+        : '';
+    const safeOnlineUrl = rawSavedUrl
+      ? isPrivateAiStudioDevUrl(rawSavedUrl)
+        ? mapToPublicOnlineOrigin(rawSavedUrl)
+        : rawSavedUrl
+      : defaults.onlineBaseUrl;
     return {
-      onlineBaseUrl:
-        typeof parsed.onlineBaseUrl === 'string' && parsed.onlineBaseUrl.trim()
-          ? normalizeBaseUrl(parsed.onlineBaseUrl)
-          : defaults.onlineBaseUrl,
+      onlineBaseUrl: safeOnlineUrl,
       wifiSsid: typeof parsed.wifiSsid === 'string' ? parsed.wifiSsid : '',
       wifiPassword: typeof parsed.wifiPassword === 'string' ? parsed.wifiPassword : '',
       wifiSecurity:
@@ -122,10 +163,13 @@ export function buildOnlineMenuUrl(
   onlineBaseUrl: string,
   tableLabel?: string
 ): string {
-  const base =
-    normalizeBaseUrl(onlineBaseUrl) ||
-    getDefaultOnlineBaseUrl() ||
-    (typeof window !== 'undefined' ? window.location.origin.replace(/\/+$/, '') : '');
+  const normalizedInput = normalizeBaseUrl(onlineBaseUrl);
+  const safeInput = isPrivateAiStudioDevUrl(normalizedInput)
+    ? mapToPublicOnlineOrigin(normalizedInput)
+    : normalizedInput;
+  const fallbackOrigin =
+    typeof window !== 'undefined' ? mapToPublicOnlineOrigin(window.location.origin) : '';
+  const base = safeInput || getDefaultOnlineBaseUrl() || fallbackOrigin;
   const tableSuffix = tableLabel?.trim()
     ? `&table=${encodeURIComponent(tableLabel.trim())}`
     : '';
